@@ -1,184 +1,259 @@
 name: YouTube Live Recorder
+run-name: Recorder session ${{ inputs.session_id || github.run_id }} / shift ${{ inputs.shift_index || 0 }}
 
 on:
   workflow_dispatch:
     inputs:
-      duration_hours:
-        description: 'Recording window in hours (use 0.17 for a 10-minute authorized test; leave 5 for the evening run)'
-        required: false
-        default: 5
+      total_hours:
+        description: 'Hours from your manual start: 8, 9, 10, or 12 (max 14; use 0.05 for a short test)'
+        required: true
+        default: 10
         type: number
-  schedule:
-    # Shift 2 only: 00:50 India time (19:20 UTC). Start Shift 1 manually.
-    - cron: '20 19 * * *'
+      release_backup:
+        description: 'Backup failed Gofile uploads to GitHub Releases (public in public repos)'
+        required: true
+        default: true
+        type: boolean
+      session_start:
+        description: 'Internal; leave empty for a fresh start'
+        required: false
+        default: ''
+        type: string
+      session_id:
+        description: 'Internal; leave empty for a fresh start'
+        required: false
+        default: ''
+        type: string
+      shift_index:
+        description: 'Internal; leave zero for a fresh start'
+        required: false
+        default: 0
+        type: number
 
 permissions:
   contents: read
 
-env:
-  HOURS: ${{ github.event.inputs.duration_hours || '5.0' }}
-  OUT_DIR: './streams'
+# Duplicate dispatches for one window serialize; expired windows are skipped.
+# Different window indexes may overlap as intended.
+concurrency:
+  group: recorder-${{ github.workflow }}-${{ inputs.session_id || github.run_id }}-${{ inputs.shift_index || 0 }}
+  cancel-in-progress: false
 
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
+      active: ${{ steps.plan.outputs.active }}
+      deadline: ${{ steps.plan.outputs.deadline }}
+      window_deadline: ${{ steps.plan.outputs.window_deadline }}
+      chain: ${{ steps.plan.outputs.chain }}
+      next_at: ${{ steps.plan.outputs.next_at }}
+      next_index: ${{ steps.plan.outputs.next_index }}
+      session_start: ${{ steps.plan.outputs.session_start }}
+      session_id: ${{ steps.plan.outputs.session_id }}
+      total_hours: ${{ steps.plan.outputs.total_hours }}
       matrix: ${{ steps.channels.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
-      - name: Read channel list
+      - name: Require a usable cookie file before starting any shifts
+        env:
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          python3 - <<'PYCODE'
+          import os
+          raw = os.environ.pop('YT_COOKIES', '')
+          good = False
+          for line in raw.splitlines():
+              if line.startswith('#HttpOnly_'): line = line[len('#HttpOnly_'):]
+              if not line or line.startswith('#'): continue
+              fields = line.split('\t')
+              domain = fields[0].lstrip('.').lower()
+              if len(fields) >= 7 and (domain == 'youtube.com' or domain.endswith('.youtube.com')) and fields[-1]: good = True
+          raw = ''
+          if not good: raise SystemExit('YT_COOKIES is missing or malformed. Add the complete private cookie file in repository Actions secrets; no continuation shifts started.')
+          print('Private cookie file binding found; values withheld. Authentication still depends on YouTube.')
+          PYCODE
+      - name: Plan bounded session
+        id: plan
+        env:
+          TOTAL_HOURS: ${{ inputs.total_hours }}
+          SESSION_START: ${{ inputs.session_start }}
+          SESSION_ID: ${{ inputs.session_id }}
+          SHIFT_INDEX: ${{ inputs.shift_index }}
+        run: python3 shift_plan.py
+      - name: Validate exactly one channel
         id: channels
         run: |
-          python - <<'PY' >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           with open('channels.json', encoding='utf-8-sig') as f:
               channels = json.load(f)
-          if not isinstance(channels, list) or not channels:
-              raise SystemExit('channels.json must be a non-empty JSON array')
-          for item in channels:
-              if not isinstance(item, dict) or not item.get('handle') or not item.get('id'):
-                  raise SystemExit('Each channel needs handle and id')
+          if not isinstance(channels, list) or len(channels) != 1:
+              raise SystemExit('channels.json must contain exactly one channel')
+          item = channels[0]
+          if not isinstance(item, dict) or not isinstance(item.get('handle'), str) or not item['handle'].startswith('@'):
+              raise SystemExit('A channel @handle is required')
+          if item.get('id') and not isinstance(item['id'], str):
+              raise SystemExit('Channel id must be a string or empty')
           print('matrix=' + json.dumps({'channel': channels}, separators=(',', ':')))
           PY
 
   record:
     needs: prepare
+    if: needs.prepare.outputs.active == 'true'
     runs-on: ubuntu-latest
-    # GitHub-hosted jobs have a hard execution ceiling; reserve the remaining
-    # time after the 5h monitor for finalization, upload and fallback artifact.
     timeout-minutes: 360
+    permissions:
+      contents: write  # Required for the enabled Release backup.
     strategy:
       fail-fast: false
-      max-parallel: 20
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     name: Record ${{ matrix.channel.handle }}
     steps:
       - uses: actions/checkout@v4
-      - name: Free unused runner packages and report remaining disk
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
-          df -h /
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Install system tools
+      - name: Install dependencies and show actual free disk
+        timeout-minutes: 15
         run: |
+          set -euo pipefail
+          missing=()
+          for executable in ffmpeg curl rclone; do
+            if ! command -v "$executable" >/dev/null; then missing+=("$executable"); fi
+          done
+          if ((${#missing[@]})); then
+            sudo apt-get -o Acquire::Retries=3 update -qq
+            sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 "${missing[@]}"
+          fi
+          python -m pip install -q 'yt-dlp[default,curl-cffi]==2026.10.21'
+          df -h .
+      - name: Setup Cloudflare WARP (Anti-Bot Anycast IP)
+        timeout-minutes: 5
+        continue-on-error: true
+        run: |
+          set -e
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg curl jq
-      - name: Record this channel for five hours
+          sudo apt-get install -y --no-install-recommends cloudflare-warp
+          sudo warp-cli --accept-tos registration new || true
+          sudo warp-cli --accept-tos mode warp
+          sudo warp-cli --accept-tos connect
+          sleep 3
+          echo "Public IP masked via Cloudflare:"
+          curl -s https://ifconfig.me || true
+      - name: Record current window
+        id: capture
+        timeout-minutes: 190
+        continue-on-error: true
         env:
           CHANNEL_HANDLE: ${{ matrix.channel.handle }}
           TARGET_CHANNEL_ID: ${{ matrix.channel.id }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
+          SESSION_DEADLINE: ${{ needs.prepare.outputs.window_deadline }}
+          OUT_DIR: streams
         run: |
-          if [[ -n "$YT_COOKIES" ]]; then
-            printf '%s' "$YT_COOKIES" > cookies.txt
-            export USE_COOKIES='true'
-            export COOKIE_FILE='cookies.txt'
-          else
-            echo 'YT_COOKIES secret is missing; continuing without cookies.'
-            export USE_COOKIES='false'
-            export COOKIE_FILE=''
+          set -euo pipefail
+          cookie_path="$RUNNER_TEMP/youtube-recording-cookies.txt"
+          trap 'rm -f "$cookie_path"' EXIT
+          if [[ -z "$YT_COOKIES" ]]; then
+            echo '::error::YT_COOKIES is missing; refusing to claim an authenticated test.'
+            exit 2
           fi
+          python3 -c "import os; open('$cookie_path', 'w', encoding='utf-8', newline='\n').write(os.environ.get('YT_COOKIES', '').lstrip('\ufeff'))"
+          export USE_COOKIES=true COOKIE_FILE="$cookie_path"
+          unset YT_COOKIES
+          HOURS="$(python shift_plan.py --duration-until "$SESSION_DEADLINE")"
+          export HOURS
           python recorder.py
-      - name: Upload recording files to Gofile
+      - name: Upload to Drive first, then Gofile and Release fallback
         id: publish
-        if: always()
+        if: always() && steps.capture.outcome != 'skipped'
+        timeout-minutes: 122
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+          GOFILE_FOLDER_ID: ${{ vars.GOFILE_FOLDER_ID }}
+          RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
+          GDRIVE_REMOTE: ${{ vars.GDRIVE_REMOTE || 'drive:YouTubeRecordings' }}
+          RELEASE_BACKUP: ${{ inputs.release_backup }}
         run: |
-          mkdir -p streams
-          failed=0
-          found=0
-          fallback_paths=''
-          links_file="$RUNNER_TEMP/recorder-links.txt"
-          : > "$links_file"
-          stagger=$(( (RANDOM % 56) + 5 ))
-          echo "Waiting ${stagger}s before upload to spread concurrent jobs."
-          sleep "$stagger"
-          while IFS= read -r -d '' f; do
-            found=1
-            echo "Uploading $(basename "$f")"
-            ok=0
-            for attempt in 1 2 3; do
-              response=$(curl --fail --silent --show-error --max-time 1800 \
-                -X POST 'https://upload.gofile.io/uploadfile' \
-                -F "file=@$f" || true)
-              status=$(printf '%s' "$response" | jq -r '.status // empty' 2>/dev/null || true)
-              link=$(printf '%s' "$response" | jq -r '.data.downloadPage // empty' 2>/dev/null || true)
-              if [[ "$status" == 'ok' && -n "$link" ]]; then
-                echo "$(basename "$f"): $link" | tee -a "$GITHUB_STEP_SUMMARY"
-                printf '%s: %s\n' "$(basename "$f")" "$link" >> "$links_file"
-                ok=1
-                break
-              fi
-              echo "Upload attempt $attempt failed; retrying."
-              sleep $((attempt * 10))
-            done
-            if (( ok == 0 )); then
-              echo "UPLOAD FAILED; scheduling Actions artifact backup: $(basename "$f")" | tee -a "$GITHUB_STEP_SUMMARY"
-              fallback_paths+="$f"$'\n'
-              failed=1
-            fi
-          done < <(find streams -type f -size +1M -name '*.ts' ! -name '*_short_exit_*' -print0)
-          if (( found == 0 )); then
-            echo 'No recording file found.' | tee -a "$GITHUB_STEP_SUMMARY"
-            echo '::warning::This channel job completed without a recording file.'
-          fi
-          {
-            printf 'fallback_paths<<EOF\n'
-            printf '%s' "$fallback_paths"
-            printf 'EOF\n'
-          } >> "$GITHUB_OUTPUT"
-          echo "links_file=$links_file" >> "$GITHUB_OUTPUT"
-          echo "found=$found" >> "$GITHUB_OUTPUT"
-          exit "$failed"
-      - name: Preserve failed uploads as a temporary video artifact
-        id: media-backup
-        if: always() && steps.publish.outputs.fallback_paths != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: video-backup-${{ matrix.channel.handle }}-${{ github.run_id }}
-          path: ${{ steps.publish.outputs.fallback_paths }}
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
-      - name: Save small diagnostic files
+          set -euo pipefail
+          args=()
+          if [[ "$RELEASE_BACKUP" == true ]]; then args+=(--release-fallback); fi
+          python run_upload.py --root streams --report upload-report.json --budget 7200 "${args[@]}"
+      - name: Save small diagnostics and verified upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diagnostics-${{ matrix.channel.handle }}-${{ github.run_id }}
+          name: diagnostics-${{ github.run_id }}-${{ inputs.shift_index || 0 }}
           path: |
-            streams/**/*_session.log
+            upload-report.json
             streams/**/*_summary.json
-          if-no-files-found: ignore
-          retention-days: 3
-      - name: Send links to Telegram (text only)
-        if: always() && steps.publish.outputs.found == '1'
+          if-no-files-found: warn
+          retention-days: 2
+      - name: Optional Telegram text notification
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          LINKS_FILE: ${{ steps.publish.outputs.links_file }}
-          VIDEO_BACKUP_URL: ${{ steps['media-backup'].outputs['artifact-url'] }}
+          RECORD_OUTCOME: ${{ steps.capture.outcome }}
           CHANNEL_HANDLE: ${{ matrix.channel.handle }}
+        run: python notify_telegram.py
+      - name: Report actual recording and publication status
+        if: always()
+        env:
+          CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.publish.outcome }}
         run: |
-          if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
-            echo 'Telegram secrets are not configured; skipping text notification.'
-            exit 0
-          fi
-          message="YouTube recorder result: ${CHANNEL_HANDLE}"
-          if [[ -n "$LINKS_FILE" && -s "$LINKS_FILE" ]]; then
-            message+=$'\n'"$(cat "$LINKS_FILE")"
-          fi
-          if [[ -n "$VIDEO_BACKUP_URL" ]]; then
-            message+=$'\n'"Upload failed; temporary GitHub video backup (sign-in/access may be required): ${VIDEO_BACKUP_URL}"
-          fi
-          if [[ "$message" == "YouTube recorder result: ${CHANNEL_HANDLE}" ]]; then
-            message+=$'\nRecording files were found, but external upload failed. Check this job’s Summary and artifacts.'
-          fi
-          curl --fail --silent --show-error --max-time 30 \
-            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${message}"
+          python - <<'PY'
+          import json, os, pathlib
+          lines = ['Recording step: '+os.environ['CAPTURE_OUTCOME'], 'Upload step: '+os.environ['UPLOAD_OUTCOME']]
+          path = pathlib.Path('upload-report.json')
+          report = json.loads(path.read_text()) if path.exists() else {}
+          files = report.get('files', [])
+          if not files:
+              lines.append('🟢 Shift complete: Streamer was offline throughout this window. No recording needed.')
+          else:
+              for item in files:
+                  status_str = 'uploaded' if item.get('uploaded') else 'FAILED'
+                  lines.append(f"{item['file']}: {status_str}")
+                  lines.extend(r.get('url', '') for r in item.get('receipts', []))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+              stream.write('\n\n'.join(lines)+'\n')
+          if os.environ['CAPTURE_OUTCOME'] != 'success' or os.environ['UPLOAD_OUTCOME'] != 'success':
+              raise SystemExit('Recording or upload step failed with an error.')
+          if files and not report.get('all_uploaded'):
+              raise SystemExit('Some recorded stream files failed to upload.')
+          PY
+
+  next-shift:
+    needs: prepare
+    if: needs.prepare.outputs.chain == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 140
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dispatch next overlapping window
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_REF: ${{ github.ref_name }}
+          TOTAL_HOURS: ${{ needs.prepare.outputs.total_hours }}
+          SESSION_START: ${{ needs.prepare.outputs.session_start }}
+          SESSION_ID: ${{ needs.prepare.outputs.session_id }}
+          NEXT_INDEX: ${{ needs.prepare.outputs.next_index }}
+          NEXT_AT: ${{ needs.prepare.outputs.next_at }}
+          DEADLINE: ${{ needs.prepare.outputs.deadline }}
+          RELEASE_BACKUP: ${{ inputs.release_backup }}
+        run: python3 chain_shift.py
