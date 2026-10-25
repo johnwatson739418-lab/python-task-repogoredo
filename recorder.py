@@ -51,9 +51,9 @@ USE_COOKIES = (
 
 FORMAT_SELECTOR = os.getenv(
     "FORMAT_SELECTOR",
-    "b[height<=1440][protocol*=m3u8]/b[protocol*=m3u8]/b[height<=1440]/b",
+    "b[height<=1080][height>=480][protocol*=m3u8]/b[height<=720][protocol*=m3u8]/b[protocol*=m3u8]/b[height<=1080][height>=480]/b[height<=720]/b",
 )
-SORT_EXPR = "res,fps,br"
+SORT_EXPR = "res:720,fps,br"
 
 PRIMARY_RECHECK_SECONDS = 25
 ACTIVE_SESSION_RECHECK_SECONDS = 120
@@ -65,9 +65,23 @@ HTML_TIMEOUT_SECONDS = 15
 
 HEARTBEAT_SECONDS = 15
 POLL_INTERVAL_SECONDS = 2
-STALL_SECONDS = 240
+STALL_SECONDS = int(os.getenv("STALL_SECONDS", "120"))
 OFFLINE_GRACE_SECONDS = 180
 FAILURE_COOLDOWN_SECONDS = 15
+
+FATAL_ERRORS_COUNT = 0
+LAST_FATAL_ERROR = None
+FATAL_ERROR_LOCK = threading.Lock()
+LIVE_DETECTED_EVER = False
+
+
+def record_fatal_error(reason):
+    global FATAL_ERRORS_COUNT, LAST_FATAL_ERROR
+    with FATAL_ERROR_LOCK:
+        FATAL_ERRORS_COUNT += 1
+        LAST_FATAL_ERROR = str(reason)
+
+
 
 MIN_SAVE_BYTES = 1880  # Preserve small captures; the publisher probes video validity.
 MIN_FREE_BYTES = 512 * 1024 * 1024
@@ -158,12 +172,13 @@ def normalize_token(value):
 def normalize_message(value):
     value = unicodedata.normalize("NFKD", str(value or ""))
     return (
-        value.replace("’", "'")
-        .replace("‘", "'")
-        .replace("“", '"')
-        .replace("”", '"')
+        value.replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
         .casefold()
     )
+
 
 
 BOTCHECK_MARKERS = ["sign in to confirm you're not a bot", "confirm you're not a bot"]
@@ -393,16 +408,25 @@ def run_ytdlp_json(url, client):
             if raw.get("_type") == "playlist" and raw.get("entries"):
                 for item in raw["entries"]:
                     if item and is_live_candidate(item):
+                        global LIVE_DETECTED_EVER
+                        LIVE_DETECTED_EVER = True
                         return item
                 return raw["entries"][0]
+            if is_live_candidate(raw):
+                LIVE_DETECTED_EVER = True
             return raw
         if result.returncode:
             message = normalize_message(result.stderr)
             reason = "botcheck" if any(marker in message for marker in BOTCHECK_MARKERS) else (
                 "rate_limited" if any(marker in message for marker in RATE_LIMIT_MARKERS) else (
-                "not_live" if any(marker in message for marker in NOT_LIVE_MARKERS) else "extraction_failed"))
+                "no_formats" if any(marker in message for marker in NO_FORMAT_MARKERS) else (
+                "unavailable" if any(marker in message for marker in UNAVAILABLE_MARKERS) else (
+                "not_live" if any(marker in message for marker in NOT_LIVE_MARKERS) else "extraction_failed"))))
             err_snip = " ".join(result.stderr.split())[:180]
             log(f"probe_failed | client={client_label(client)} | reason={reason} | exit={result.returncode} | err={err_snip}")
+            if reason in {"botcheck", "rate_limited", "no_formats", "unavailable", "extraction_failed"}:
+                record_fatal_error(reason)
+
     except subprocess.TimeoutExpired:
         log(f"probe_failed | client={client_label(client)} | reason=timeout")
     except Exception as exc:
@@ -474,6 +498,8 @@ def verify_live_id(video_id, source_kind):
         executor.shutdown(wait=False)
 
     if result:
+        global LIVE_DETECTED_EVER
+        LIVE_DETECTED_EVER = True
         elapsed = time.monotonic() - started
         log(f"detect_live | source={source_kind} | live id={result['id']} | client={client_label(result['client'])} | match={result['match_reason']} | validation={elapsed:.1f}s")
         return {"id": result["id"], "url": result["url"], "source": source_kind, "detected_client": result["client"]}
@@ -514,8 +540,10 @@ def probe_fast():
         if not matched:
             continue
         video_id = info["id"]
+        LIVE_DETECTED_EVER = True
         log(f"detect_live | source=live_endpoint | live id={video_id} | client={client} | match={reason}")
         return {"id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}", "source": "live_endpoint", "detected_client": client}
+
 
     for video_id in extract_live_badge_ids(home_html)[:2]:
         result = verify_live_id(video_id, "home_live_badge")
@@ -965,7 +993,11 @@ def run_download_attempt(active, session_end, client, live_queue):
         log_raw("download_launch_error", exc)
         active["recording_path"] = None
         save_active_state(active)
+        if "record_fatal_error" in globals() and callable(globals()["record_fatal_error"]):
+            globals()["record_fatal_error"]("launch_error")
         return False, "launch_error", None
+
+
 
     with CURRENT_PROC_LOCK:
         CURRENT_PROC = process
@@ -1035,15 +1067,18 @@ def run_download_attempt(active, session_end, client, live_queue):
     )
 
     # Preserve explicit authentication/rate-limit errors before short-exit handling.
-    if output_state["botcheck"] or output_state["rate_limited"] or output_state["unavailable"]:
+    if output_state["botcheck"] or output_state["rate_limited"] or output_state["unavailable"] or output_state["no_formats"]:
         # Keep partial media even if a later request loses access.
         if saved_path and saved_bytes >= MIN_SAVE_BYTES:
             append_chunk(active, saved_path, client, "access_lost")
         active["recording_path"] = None
         reason = classify_output(output_state)
         save_active_state(active)
+        if "record_fatal_error" in globals() and callable(globals()["record_fatal_error"]):
+            globals()["record_fatal_error"](reason)
         log(f"download_blocked | client={client_label(client)} | reason={reason}")
         return False, reason, replacement_live
+
 
     if unexpected_short_exit:
         if saved_path and os.path.isfile(saved_path):
@@ -1081,7 +1116,12 @@ def run_download_attempt(active, session_end, client, live_queue):
     if stop_reason and reason == "no_file":
         reason = stop_reason
     log(f"download_failed | client={client_label(client)} | reason={reason} | duration={duration:.1f}s")
+    if reason in {"botcheck", "rate_limited", "unavailable", "no_formats", "extraction_failed"}:
+        if "record_fatal_error" in globals() and callable(globals()["record_fatal_error"]):
+            globals()["record_fatal_error"](reason)
     return False, reason, replacement_live
+
+
 
 
 def recovery_delay(reason, active):
@@ -1218,7 +1258,8 @@ def main():
     primary_thread.start()
     secondary_thread.start()
 
-    log(f"started | channel={CHANNEL_HANDLE} | id={TARGET_CHANNEL_ID} | duration={HOURS}h | cookies={USE_COOKIES} | stall=240s")
+    log(f"started | channel={CHANNEL_HANDLE} | id={TARGET_CHANNEL_ID} | duration={HOURS}h | cookies={USE_COOKIES} | stall={STALL_SECONDS}s")
+
 
     try:
         while time.time() < session_end and not STOP_REQUESTED:
@@ -1291,9 +1332,22 @@ def main():
     log("session_complete")
     if DISK_LIMIT_REACHED:
         raise SystemExit(3)
-    if not any(os.path.getsize(path) >= MIN_SAVE_BYTES for path in glob.glob(os.path.join(OUT_DIR, "**", "*.ts"), recursive=True)):
-        log("no_recording_saved | channel was offline during this shift; monitoring window completed cleanly.")
-        sys.exit(0)
+    saved_paths = [
+        path for path in glob.glob(os.path.join(OUT_DIR, "**", "*.ts"), recursive=True)
+        if os.path.getsize(path) >= MIN_SAVE_BYTES
+    ]
+
+    if not saved_paths:
+        if LIVE_DETECTED_EVER or FATAL_ERRORS_COUNT > 0:
+            failure_reason = LAST_FATAL_ERROR or ("live_detected_but_zero_bytes" if LIVE_DETECTED_EVER else "probe_blocked")
+            log(f"recording_failed | stream was detected or requests blocked by YouTube: reason={failure_reason} (fatal_errors={FATAL_ERRORS_COUNT}, live_detected={LIVE_DETECTED_EVER}). Exiting with code 2.")
+            write_summary(status="failed", failure_reason=failure_reason)
+            sys.exit(2)
+        else:
+            log("no_recording_saved | channel was offline during this shift; monitoring window completed cleanly without blocks.")
+            write_summary(status="offline", failure_reason=None)
+            sys.exit(0)
+
 
 
 if __name__ == "__main__":

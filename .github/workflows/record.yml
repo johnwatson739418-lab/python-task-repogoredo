@@ -7,8 +7,9 @@ on:
       total_hours:
         description: 'Hours from your manual start: 8, 9, 10, or 12 (max 14; use 0.05 for a short test)'
         required: true
-        default: 10
+        default: 9
         type: number
+
       release_backup:
         description: 'Backup failed Gofile uploads to GitHub Releases (public in public repos)'
         required: true
@@ -132,22 +133,8 @@ jobs:
           fi
           python -m pip install -q 'yt-dlp[default,curl-cffi]==2026.10.21'
           df -h .
-      - name: Setup Cloudflare WARP (Anti-Bot Anycast IP)
-        timeout-minutes: 5
-        continue-on-error: true
-        run: |
-          set -e
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends cloudflare-warp
-          sudo warp-cli --accept-tos registration new || true
-          sudo warp-cli --accept-tos mode warp
-          sudo warp-cli --accept-tos connect
-          sleep 3
-          echo "Public IP masked via Cloudflare:"
-          curl -s https://ifconfig.me || true
       - name: Record current window
+
         id: capture
         timeout-minutes: 190
         continue-on-error: true
@@ -215,25 +202,37 @@ jobs:
           UPLOAD_OUTCOME: ${{ steps.publish.outcome }}
         run: |
           python - <<'PY'
-          import json, os, pathlib
-          lines = ['Recording step: '+os.environ['CAPTURE_OUTCOME'], 'Upload step: '+os.environ['UPLOAD_OUTCOME']]
+          import glob, json, os, pathlib
+          lines = ['Recording step: ' + os.environ['CAPTURE_OUTCOME'], 'Upload step: ' + os.environ['UPLOAD_OUTCOME']]
           path = pathlib.Path('upload-report.json')
           report = json.loads(path.read_text()) if path.exists() else {}
           files = report.get('files', [])
+          summary_files = glob.glob('streams/**/*_summary.json', recursive=True)
+          summary = {}
+          if summary_files:
+              try:
+                  summary = json.loads(pathlib.Path(summary_files[0]).read_text(encoding='utf-8'))
+              except Exception:
+                  pass
           if not files:
-              lines.append('🟢 Shift complete: Streamer was offline throughout this window. No recording needed.')
+              if os.environ['CAPTURE_OUTCOME'] == 'success':
+                  lines.append('🟢 Shift complete: Streamer was genuinely offline throughout this window. No recording needed.')
+              else:
+                  reason = summary.get('failure_reason') or 'YouTube blocked probes or live capture failed'
+                  lines.append(f'🔴 Shift FAILED: 0 bytes recorded. YouTube error: {reason}')
           else:
               for item in files:
                   status_str = 'uploaded' if item.get('uploaded') else 'FAILED'
                   lines.append(f"{item['file']}: {status_str}")
                   lines.extend(r.get('url', '') for r in item.get('receipts', []))
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
-              stream.write('\n\n'.join(lines)+'\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as stream:
+              stream.write('\n\n'.join(lines) + '\n')
           if os.environ['CAPTURE_OUTCOME'] != 'success' or os.environ['UPLOAD_OUTCOME'] != 'success':
               raise SystemExit('Recording or upload step failed with an error.')
           if files and not report.get('all_uploaded'):
               raise SystemExit('Some recorded stream files failed to upload.')
           PY
+
 
   next-shift:
     needs: prepare
