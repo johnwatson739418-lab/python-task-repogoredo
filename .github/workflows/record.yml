@@ -21,6 +21,16 @@ on:
       shift_index:
         type: number
         default: 0
+      shift_step_seconds:
+        description: Override shift step seconds (for rapid testing, e.g. 600)
+        required: false
+        type: string
+        default: ''
+      shift_window_seconds:
+        description: Override shift window seconds (for rapid testing, e.g. 900)
+        required: false
+        type: string
+        default: ''
 permissions:
   contents: read
 concurrency:
@@ -40,6 +50,8 @@ jobs:
       session_start: ${{ steps.plan.outputs.session_start }}
       session_id: ${{ steps.plan.outputs.session_id }}
       total_hours: ${{ steps.plan.outputs.total_hours }}
+      shift_step_seconds: ${{ steps.plan.outputs.shift_step_seconds }}
+      shift_window_seconds: ${{ steps.plan.outputs.shift_window_seconds }}
       matrix: ${{ steps.channels.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +62,8 @@ jobs:
           SESSION_START: ${{ inputs.session_start }}
           SESSION_ID: ${{ inputs.session_id }}
           SHIFT_INDEX: ${{ inputs.shift_index }}
+          SHIFT_STEP_SECONDS: ${{ inputs.shift_step_seconds }}
+          SHIFT_WINDOW_SECONDS: ${{ inputs.shift_window_seconds }}
         run: python3 shift_plan.py
       - name: Validate one channel
         id: channels
@@ -80,6 +94,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell /usr/share/swift 2>/dev/null || true
+          df -h /
       - name: Install pinned capture dependency and fast static tools
         timeout-minutes: 4
         run: |
@@ -113,6 +131,7 @@ jobs:
           OUT_DIR: streams
           FORMAT_SELECTOR: best[height<=1440][protocol*=m3u8]/best[protocol*=m3u8]/best
           CAPTURE_TRANSPORT: streamlink_hls
+          CAPTURE_LOCAL_BYTES_LIMIT: '21474836480'
           SKIP_DEPENDENCY_INSTALL: 'true'
           SAFETY_CLIP_SECONDS: '300'
           SAFETY_CLIP_OVERLAP: '15'
@@ -200,5 +219,7 @@ jobs:
           NEXT_INDEX: ${{ needs.prepare.outputs.next_index }}
           NEXT_AT: ${{ needs.prepare.outputs.next_at }}
           DEADLINE: ${{ needs.prepare.outputs.deadline }}
+          SHIFT_STEP_SECONDS: ${{ needs.prepare.outputs.shift_step_seconds }}
+          SHIFT_WINDOW_SECONDS: ${{ needs.prepare.outputs.shift_window_seconds }}
           WORKFLOW_FILE: record.yml
         run: python3 chain_shift.py

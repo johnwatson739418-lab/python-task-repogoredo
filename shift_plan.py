@@ -44,6 +44,10 @@ def main():
         raise ValueError('session ID must contain digits only')
     result = plan(start, total, now, index)
     result.update(session_start=start, total_hours=total, session_id=session)
+    if os.environ.get('SHIFT_STEP_SECONDS'):
+        result['shift_step_seconds'] = os.environ['SHIFT_STEP_SECONDS']
+    if os.environ.get('SHIFT_WINDOW_SECONDS'):
+        result['shift_window_seconds'] = os.environ['SHIFT_WINDOW_SECONDS']
     print(json.dumps(result))
     destination = os.environ.get('GITHUB_OUTPUT')
     if destination:

@@ -23,12 +23,19 @@ def atomic_json(path, value):
 
 
 def probe(path):
-    result = subprocess.run(['ffprobe','-v','error','-show_entries',
-                             'format=duration:stream=codec_type','-of','json',str(path)],
-                            capture_output=True,text=True,timeout=15)
+    try:
+        result = subprocess.run(['ffprobe','-v','error','-show_entries',
+                                 'format=duration:stream=codec_type','-of','json',str(path)],
+                                capture_output=True,text=True,timeout=15)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise ValueError(f'media_probe_failed: {e}')
     if result.returncode:
         raise ValueError('media_probe_failed')
-    data=json.loads(result.stdout); duration=float(data['format']['duration'])
+    try:
+        data=json.loads(result.stdout)
+        duration=float(data['format']['duration'])
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+        raise ValueError(f'media_not_ready: {e}')
     if not math.isfinite(duration) or duration<=0 or not any(s.get('codec_type')=='video' for s in data.get('streams',[])):
         raise ValueError('media_not_ready')
     return duration
@@ -36,11 +43,14 @@ def probe(path):
 
 def make_clip(source, output, start, duration):
     output=Path(output);temp=output.with_suffix('.partial.ts')
-    result=subprocess.run(['ffmpeg','-nostdin','-hide_banner','-v','error','-y',
-                           '-i',str(source),'-ss',str(start),'-t',str(duration),
-                           '-map','0:v:0','-map','0:a:0?','-c','copy',
-                           '-avoid_negative_ts','make_zero','-mpegts_flags','+resend_headers',
-                           '-f','mpegts',str(temp)],capture_output=True,timeout=90)
+    try:
+        result=subprocess.run(['ffmpeg','-nostdin','-hide_banner','-v','error','-y',
+                               '-i',str(source),'-ss',str(start),'-t',str(duration),
+                               '-map','0:v:0','-map','0:a:0?','-c','copy',
+                               '-avoid_negative_ts','make_zero','-mpegts_flags','+resend_headers',
+                               '-f','mpegts',str(temp)],capture_output=True,timeout=90)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise ValueError(f'clip_failed: {e}')
     try:
         actual=probe(temp)
         if result.returncode or actual < max(1,duration-3):
@@ -49,6 +59,7 @@ def make_clip(source, output, start, duration):
         return actual
     finally:
         temp.unlink(missing_ok=True)
+
 
 
 class SafetyArchive:
@@ -144,42 +155,50 @@ class SafetyArchive:
         with self.lock:snapshot.write_bytes(self.report.read_bytes())
         metadata=fingerprints(snapshot)
         base=['rclone','--config',self.config]
-        copied=run_provider(base+['copyto',str(snapshot),remote,'--checksum','--contimeout','10s','--timeout','20s','--retries','1'],capture_output=True,timeout=45)
-        if copied.returncode:raise ValueError('safety_index_copy_failed')
-        result=run_provider(base+['lsjson',remote,'--stat','--hash'],capture_output=True,text=True,timeout=20)
-        data=json.loads(result.stdout)
-        if result.returncode or data.get('Size')!=metadata['bytes'] or data.get('Hashes',{}).get('md5')!=metadata['md5']:
-            raise ValueError('safety_index_verification_failed')
+        try:
+            copied=run_provider(base+['copyto',str(snapshot),remote,'--checksum','--contimeout','10s','--timeout','20s','--retries','1'],capture_output=True,timeout=45)
+            if copied.returncode:raise ValueError('safety_index_copy_failed')
+            result=run_provider(base+['lsjson',remote,'--stat','--hash'],capture_output=True,text=True,timeout=20)
+            data=json.loads(result.stdout)
+            if result.returncode or data.get('Size')!=metadata['bytes'] or data.get('Hashes',{}).get('md5')!=metadata['md5']:
+                raise ValueError('safety_index_verification_failed')
+        except (subprocess.TimeoutExpired, OSError, PublishError, ValueError, json.JSONDecodeError) as e:
+            raise ValueError(f'safety_index_failed: {e}')
 
     def upload_pending(self):
         while not self.stop.is_set():
-            with self.lock:
-                clip=next((c for c in self.clips if c['status']=='pending' and c['retry_at']<=time.monotonic()),None)
-                if clip:clip['status']='uploading'
-            if clip is None:
-                if self.capture_finished:return
-                self.stop.wait(.25);continue
-            path=self.work/clip['local']
             try:
-                metadata=fingerprints(path, deadline=time.monotonic()+30)
-                receipt=self.upload(path,metadata)
-                if not isinstance(receipt,dict) or not receipt.get('verification'):
-                    raise ValueError('safety_receipt_unverified')
                 with self.lock:
-                    clip.update(status='uploaded',receipt=receipt,bytes=metadata['bytes'],sha256=metadata['sha256'])
-                path.unlink(missing_ok=True)
-                self.save()
+                    clip=next((c for c in self.clips if c['status']=='pending' and c['retry_at']<=time.monotonic()),None)
+                    if clip:clip['status']='uploading'
+                if clip is None:
+                    if self.capture_finished:return
+                    self.stop.wait(.25);continue
+                path=self.work/clip['local']
                 try:
-                    if not self.stop.is_set():self.upload_index(receipt)
-                except (OSError,ValueError,subprocess.TimeoutExpired):self.last_error='safety_index_upload_pending'
-            except (OSError,ValueError,PublishError,subprocess.TimeoutExpired):
-                with self.lock:
-                    clip['attempts']+=1;clip['status']='pending'
-                    clip['retry_at']=time.monotonic()+min(300,30*2**min(clip['attempts']-1,4))
-                    self.last_error='safety_upload_failed_original_and_clip_kept'
-                # A failed provider must not cause a tight loop across all queued files.
-                self.stop.wait(min(30,clip['retry_at']-time.monotonic()))
-            self.save()
+                    metadata=fingerprints(path, deadline=time.monotonic()+30)
+                    receipt=self.upload(path,metadata)
+                    if not isinstance(receipt,dict) or not receipt.get('verification'):
+                        raise ValueError('safety_receipt_unverified')
+                    with self.lock:
+                        clip.update(status='uploaded',receipt=receipt,bytes=metadata['bytes'],sha256=metadata['sha256'])
+                    path.unlink(missing_ok=True)
+                    self.save()
+                    try:
+                        if not self.stop.is_set():self.upload_index(receipt)
+                    except (OSError,ValueError,subprocess.TimeoutExpired) as e:
+                        self.last_error=f'safety_index_upload_pending: {e}'
+                except (OSError,ValueError,PublishError,subprocess.TimeoutExpired) as e:
+                    with self.lock:
+                        clip['attempts']+=1;clip['status']='pending'
+                        clip['retry_at']=time.monotonic()+min(300,30*2**min(clip['attempts']-1,4))
+                        self.last_error=f'safety_upload_failed_original_and_clip_kept: {e}'
+                    # A failed provider must not cause a tight loop across all queued files.
+                    self.stop.wait(min(30,max(1, clip['retry_at']-time.monotonic())))
+                self.save()
+            except Exception as e:
+                self.last_error = f'safety_worker_loop_error: {e}'
+                self.stop.wait(2)
 
     def run(self, capture_done):
         self.save()
@@ -189,10 +208,19 @@ class SafetyArchive:
         worker.start()
         try:
             while not capture_done.is_set() and not self.stop.is_set():
-                self.stage();capture_done.wait(10)
-            self.stage(final=True)
+                try:
+                    self.stage()
+                except Exception as exc:
+                    self.last_error = f'safety_stage_error: {exc}'
+                capture_done.wait(10)
+            try:
+                self.stage(final=True)
+            except Exception as exc:
+                self.last_error = f'safety_stage_final_error: {exc}'
             self.capture_finished=True
             worker.join(timeout=120)
+        except Exception as exc:
+            self.last_error = f'safety_run_error: {exc}'
         finally:
             # A current Drive operation has a90s budget, followed by at most
             #65s of index I/O (and30s hash budget before it). Do not delete the

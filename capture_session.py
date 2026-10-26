@@ -17,7 +17,7 @@ from publish_recordings import normalize_rclone_config, PublishError
 GIB = 1024 ** 3
 
 
-def pressure_reason(root, archive, *, local_limit=8*GIB, reserve=3*GIB):
+def pressure_reason(root, archive, *, local_limit=20*GIB, reserve=3*GIB):
     """Original captures are conservatively counted even after safety copies upload.
 
     This is a bounded local buffer, not a claim of durable storage or a perfect
@@ -125,7 +125,7 @@ def main():
                                 seconds=float(os.environ.get('SAFETY_CLIP_SECONDS', '300')),
                                 overlap=float(os.environ.get('SAFETY_CLIP_OVERLAP', '15')),
                                 max_pending_bytes=int(os.environ.get('SAFETY_PENDING_BYTES_LIMIT', str(GIB))))
-        local_limit = int(os.environ.get('CAPTURE_LOCAL_BYTES_LIMIT', str(8*GIB)))
+        local_limit = int(os.environ.get('CAPTURE_LOCAL_BYTES_LIMIT', str(20*GIB)))
         reserve = int(os.environ.get('CAPTURE_FREE_RESERVE_BYTES', str(3*GIB)))
         if local_limit <= 0 or reserve <= 0:
             save_guard_report(root, 'invalid_storage_limits')

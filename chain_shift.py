@@ -8,10 +8,15 @@ import urllib.request
 
 
 def dispatch_body():
-    return {'ref': os.environ['WORKFLOW_REF'], 'inputs': {
+    inputs = {
         'total_hours': str(os.environ['TOTAL_HOURS']), 'release_backup': 'false',
         'session_start': str(os.environ['SESSION_START']),
-        'session_id': str(os.environ['SESSION_ID']), 'shift_index': str(os.environ['NEXT_INDEX'])}}
+        'session_id': str(os.environ['SESSION_ID']), 'shift_index': str(os.environ['NEXT_INDEX'])}
+    if os.environ.get('SHIFT_STEP_SECONDS'):
+        inputs['shift_step_seconds'] = str(os.environ['SHIFT_STEP_SECONDS'])
+    if os.environ.get('SHIFT_WINDOW_SECONDS'):
+        inputs['shift_window_seconds'] = str(os.environ['SHIFT_WINDOW_SECONDS'])
+    return {'ref': os.environ['WORKFLOW_REF'], 'inputs': inputs}
 
 
 def main():
@@ -32,7 +37,8 @@ def main():
         return
     body = json.dumps(dispatch_body()).encode()
     url = f'https://api.github.com/repos/{repository}/actions/workflows/record.yml/dispatches'
-    for attempt in range(3):
+    delays = [10, 20, 30, 45, 60, 90]
+    for attempt in range(6):
         request = urllib.request.Request(url, data=body, method='POST', headers={
             'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
             'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json',
@@ -46,11 +52,12 @@ def main():
         except urllib.error.HTTPError as error:
             if error.code not in {429, 500, 502, 503, 504}:
                 raise SystemExit(f'Next-shift dispatch denied: HTTP {error.code}; check Actions write permission')
-        except (urllib.error.URLError, TimeoutError):
-            pass
-        if attempt < 2:
-            time.sleep(10 * (attempt + 1))
-    raise SystemExit('Next-shift dispatch failed after three bounded attempts')
+            print(f'Attempt {attempt+1}/6 dispatch HTTP error {error.code}, backing off...', flush=True)
+        except (urllib.error.URLError, TimeoutError) as error:
+            print(f'Attempt {attempt+1}/6 dispatch network error {error}, backing off...', flush=True)
+        if attempt < 5:
+            time.sleep(delays[attempt])
+    raise SystemExit('Next-shift dispatch failed after six bounded attempts')
 
 
 if __name__ == '__main__':
