@@ -1,5 +1,6 @@
 """Bounded, checksummed uploads. No raw provider responses or credentials logged."""
 import argparse
+import configparser
 import hashlib
 import json
 import math
@@ -9,7 +10,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+import signal
 from urllib.parse import quote, urlparse
 
 RELEASE_LIMIT = 2_000_000_000  # Strictly below GitHub's 2 GiB ceiling.
@@ -18,6 +21,71 @@ GOFILE_ENDPOINT = 'https://upload.gofile.io/uploadfile'
 
 class PublishError(Exception):
     pass
+
+
+_provider_lock=threading.Lock()
+_provider_processes=set()
+_provider_cancelled=threading.Event()
+
+
+def run_provider(command, *, capture_output=True, text=False, timeout=30, **kwargs):
+    """Own provider process groups so shutdown cannot orphan a live upload."""
+    if _provider_cancelled.is_set():raise PublishError('provider_shutdown_requested')
+    process=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE,text=text,start_new_session=True,**kwargs)
+    with _provider_lock:_provider_processes.add(process)
+    try:
+        if _provider_cancelled.is_set() and process.poll() is None:
+            os.killpg(process.pid,signal.SIGKILL)
+        try:
+            stdout,stderr=process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:os.killpg(process.pid,signal.SIGKILL)
+            except ProcessLookupError:pass
+            stdout,stderr=process.communicate(timeout=5)
+            raise subprocess.TimeoutExpired(command,timeout,output=stdout,stderr=stderr)
+        return subprocess.CompletedProcess(command,process.returncode,stdout,stderr)
+    finally:
+        with _provider_lock:_provider_processes.discard(process)
+
+
+def cancel_provider_processes():
+    _provider_cancelled.set()
+    with _provider_lock:processes=list(_provider_processes)
+    for process in processes:
+        try:
+            if process.poll() is None and os.getpgid(process.pid)==process.pid:
+                os.killpg(process.pid,signal.SIGKILL)
+        except ProcessLookupError:pass
+
+
+def normalize_rclone_config(value):
+    """Unwrap common copy/file encodings only when the resulting Drive INI validates.
+
+    Credentials are never guessed or replaced. Parser exceptions deliberately
+    stay private because they may contain token or client-secret input lines.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise PublishError('drive_config_missing_or_invalid_ini')
+    initial=value.lstrip('\ufeff').strip()
+    candidates=[initial]
+    try:
+        decoded=json.loads(initial)
+        if isinstance(decoded, str):candidates.append(decoded.lstrip('\ufeff').strip())
+    except (ValueError, TypeError):pass
+    for candidate in list(candidates):
+        if '\\n' in candidate:
+            candidates.append(candidate.replace('\\r\\n','\n').replace('\\n','\n'))
+    for candidate in candidates:
+        try:
+            parser=configparser.ConfigParser(interpolation=None)
+            parser.read_string(candidate)
+            if not parser.has_section('drive') or parser.get('drive','type',fallback='').strip()!='drive':continue
+            token=json.loads(parser.get('drive','token',fallback=''))
+            if not isinstance(token,dict) or not isinstance(token.get('refresh_token'),str) or not token['refresh_token'].strip():continue
+            return candidate.rstrip('\r\n')+'\n'
+        except (configparser.Error, ValueError, TypeError, AttributeError):continue
+    raise PublishError('drive_config_missing_or_invalid_ini')
 
 
 def fingerprints(path, deadline=None):
@@ -63,9 +131,10 @@ def media_ok(path, timeout=15):
 
 def select_media(root):
     # Include recovered nested chunks and short captures; never discard by size/name alone.
-    return sorted(p for p in root.rglob('*') if p.is_file() and not p.is_symlink()
+    return sorted((p for p in root.rglob('*') if p.is_file() and not p.is_symlink()
                   and p.suffix.lower() in {'.ts', '.part', '.mp4', '.mkv'}
-                  and '.upload-work-' not in str(p) and p.stat().st_size > 0)
+                  and '.upload-work-' not in str(p) and p.stat().st_size > 0),
+                  key=lambda p:(len(p.relative_to(root).parts),str(p)))
 
 
 def split_for_release(source, destination, limit=RELEASE_LIMIT, timeout=300):
@@ -115,12 +184,20 @@ class Publisher:
             raise ValueError('Upload budget must be 10..7200 seconds')
         self.root, self.report = Path(root), Path(report)
         self.end = time.monotonic() + budget
-        self.release_fallback, self.endpoint = release_fallback, endpoint
-        self.token = os.environ.get('GOFILE_TOKEN', '')
-        self.folder = os.environ.get('GOFILE_FOLDER_ID', '')
+        self.release_fallback, self.endpoint = False, None
+        self.token = ''
+        self.folder = ''
         self.drive_config = os.environ.get('RCLONE_CONFIG', '')
         self.drive_prefix = os.environ.get('GDRIVE_REMOTE', 'drive:YouTubeRecordings')
         self.results = []
+        self.session_url = None
+        try:self.rolling=json.loads((self.root/'rolling-backup.json').read_text())
+        except (OSError,ValueError):self.rolling={}
+        self.category = 'recordings'
+        try:
+            self.prior = json.loads(self.report.read_text()).get('files',[])
+        except (OSError,ValueError,TypeError):
+            self.prior = []
 
     def remaining(self):
         value = self.end - time.monotonic()
@@ -130,125 +207,143 @@ class Publisher:
 
     def save(self):
         self.report.parent.mkdir(parents=True, exist_ok=True)
-        all_ok = all(r.get('uploaded') for r in self.results) if self.results else True
-        value = {'files': self.results, 'all_uploaded': all_ok}
+        value = {'files': self.results, 'all_uploaded': bool(self.results) and
+                 all(r.get('uploaded') for r in self.results), 'session_url':self.session_url,
+                 'media_status':'media_present' if self.results else 'no_media',
+                 'unique_uploaded_files':sum(bool(r.get('uploaded')) and not r.get('duplicate_of') for r in self.results),
+                 'safety_backup':{k:self.rolling.get(k) for k in ('state','uploaded_clips','pending_clips','last_error')}}
         temporary = self.report.with_suffix('.tmp')
         temporary.write_text(json.dumps(value, indent=2))
         os.replace(temporary, self.report)
 
-    def gofile(self, path, metadata):
-        # With backup enabled, spend at most one attempt on Gofile and retain
-        # at least ten minutes of the shared deadline for the backup path.
-        attempts = 1 if self.release_fallback else 2
-        for attempt in range(attempts):
-            available = self.remaining() - (600 if self.release_fallback else 0)
-            if available < 1:
-                raise PublishError('gofile_budget_reserved_for_backup')
-            seconds = min(600, available)
-            config = ''
-            if self.token:
-                if any(c in self.token for c in '\r\n"\\'):
-                    raise PublishError('invalid_gofile_token_binding')
-                config = 'header = "Authorization: Bearer ' + self.token + '"\n'
-            args = ['curl', '--config', '-', '--silent', '--show-error', '--fail',
-                    '--connect-timeout', str(min(15, seconds)), '--max-time', str(seconds),
-                    '--form', 'file=@' + str(path)]
-            if self.folder:
-                args += ['--form-string', 'folderId=' + self.folder]
-            process = subprocess.run(args + [self.endpoint], input=config, capture_output=True,
-                                     text=True, timeout=min(self.remaining() + 2, seconds + 2))
-            if process.returncode == 0:
-                try:
-                    response = json.loads(process.stdout)
-                    link = validate_gofile(response, metadata)
-                    info = response['data']
-                    self.token = info.get('guestToken') or self.token
-                    self.folder = info.get('parentFolder') or self.folder
-                    return {'provider': 'gofile', 'url': link, 'verification': 'provider_size_and_md5'}
-                except (ValueError, TypeError, AttributeError, PublishError):
-                    pass
-            if attempt + 1 < attempts and self.remaining() > 6:
-                time.sleep(5)
-        raise PublishError('gofile_upload_failed')
+    def gofile(self, *args, **kwargs):
+        raise PublishError('public_backup_disabled')
 
     def google_drive(self, source, metadata):
         if not self.drive_config or not Path(self.drive_config).is_file():
             raise PublishError('google_drive_not_configured')
         if not shutil.which('rclone'):
             raise PublishError('rclone_missing')
-        seconds = min(5400, self.remaining() - 600)
+        seconds = min(5400, self.remaining())
         if seconds < 1:
-            raise PublishError('drive_budget_reserved_for_fallback')
+            raise PublishError('drive_upload_budget_exhausted')
         owner_repo = os.environ.get('GITHUB_REPOSITORY', 'local').replace('/', '_')
         run = os.environ.get('GITHUB_RUN_ID', 'local')
         name = re.sub(r'[^A-Za-z0-9_.-]+', '_', source.name)
-        remote = self.drive_prefix.rstrip('/') + '/' + owner_repo + '/' + run + '/' + metadata['sha256'][:20] + '-' + name
+        session = os.environ.get('RECORDING_SESSION_ID',run)
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',session):
+            raise PublishError('invalid_recording_session_id')
+        window = os.environ.get('RECORDING_SHIFT_INDEX','0')
+        if not window.isdigit():raise PublishError('invalid_recording_shift_index')
+        session_path = self.drive_prefix.rstrip('/')+'/'+owner_repo+'/'+session
+        remote = session_path+'/shift-'+window+'/'+self.category+'/'+metadata['sha256'][:20]+'-'+name
         base = ['rclone', '--config', self.drive_config]
-        copied = subprocess.run(base + ['copyto', str(source), remote, '--checksum',
-                                        '--retries', '2', '--low-level-retries', '3',
+        def remote_info(allow_missing=False):
+            info = run_provider(base + ['lsjson', remote, '--stat', '--hash',
+                                         '--retries', '1', '--low-level-retries', '1',
+                                         '--contimeout', '10s', '--timeout', '20s'],
+                                  capture_output=True, text=True, timeout=min(30, self.remaining()))
+            if info.returncode:
+                error = (info.stderr or '').lower()
+                if allow_missing and info.returncode in (3, 4) and 'not found' in error:
+                    return None
+                raise PublishError('google_drive_metadata_failed')
+            details = json.loads(info.stdout)
+            if not isinstance(details, dict):
+                raise PublishError('google_drive_invalid_metadata')
+            return details
+
+        def matches(details):
+            if not isinstance(details, dict): return False
+            raw_hashes = details.get('Hashes', {})
+            if not isinstance(raw_hashes, dict): return False
+            hashes = {str(k).lower(): str(v).lower() for k, v in raw_hashes.items()}
+            return details.get('Size') == metadata['bytes'] and hashes.get('md5') == metadata['md5']
+
+        details = remote_info(allow_missing=True)
+        reconciled = matches(details)
+        if details is not None and not reconciled:
+            raise PublishError('google_drive_existing_object_mismatch_source_preserved')
+        copied = None
+        copy_timed_out = False
+        if not reconciled:
+            try:
+                copied = run_provider(base + ['copyto', str(source), remote, '--checksum',
+                                        '--retries', '1', '--low-level-retries', '1',
                                         '--contimeout', '15s', '--timeout', '60s',
                                         '--drive-chunk-size', '32M', '--transfers', '1', '--checkers', '1'],
-                                capture_output=True, text=True, timeout=seconds)
-        if copied.returncode:
-            raise PublishError('google_drive_copy_failed')
-        info = subprocess.run(base + ['lsjson', remote, '--stat', '--hash'],
-                              capture_output=True, text=True, timeout=min(30, self.remaining()))
-        if info.returncode:
-            raise PublishError('google_drive_metadata_failed')
-        details = json.loads(info.stdout)
-        hashes = {k.lower(): v.lower() for k, v in details.get('Hashes', {}).items()}
-        if details.get('Size') != metadata['bytes'] or hashes.get('md5') != metadata['md5']:
-            raise PublishError('google_drive_checksum_or_size_mismatch')
+                                capture_output=True, text=True, timeout=min(seconds, max(1, self.remaining()-35)))
+            except subprocess.TimeoutExpired:
+                copy_timed_out = True
+            # A failed copy acknowledgment is ambiguous: reconcile rather than
+            # blindly publishing again. No local source is ever removed here.
+            details = remote_info()
+            if not matches(details):
+                raise PublishError('google_drive_checksum_or_size_mismatch')
         file_id = details.get('ID', '')
         link = 'https://drive.google.com/file/d/' + file_id + '/view' if re.fullmatch(r'[A-Za-z0-9_-]+', file_id) else remote
         return {'provider': 'google_drive', 'url': link, 'remote_path': remote,
-                'verification': 'remote_size_and_md5', 'sharing': 'private; no sharing permissions changed'}
+                'session_path':session_path, 'file_id':file_id,
+                'verification': 'remote_size_and_md5',
+                'reconciled_existing': reconciled,
+                'reconciled_after_ambiguous_ack': bool(copy_timed_out or (copied is not None and copied.returncode)),
+                'sharing': 'permissions_not_modified; inherited_acl_not_verified'}
 
-    def release(self, source, metadata, work):
-        repo = os.environ.get('GITHUB_REPOSITORY', '')
-        run = os.environ.get('GITHUB_RUN_ID', '')
-        if not re.fullmatch(r'[\w.-]+/[\w.-]+', repo) or not run.isdigit():
-            raise PublishError('release_environment_missing')
-        tag = 'recorder-backup-' + run
-        def gh(*args):
-            result = subprocess.run(['gh', *args], capture_output=True, text=True,
-                                    timeout=min(300, self.remaining()))
-            if result.returncode:
-                status = re.search(r'HTTP (\d{3})', result.stderr)
-                operation = '_'.join(args[:2]) if args[0] != 'api' else 'api'
-                raise PublishError('github_release_' + operation + '_failed' +
-                                   ('_http_' + status.group(1) if status else ''))
-            return result.stdout
-        exists = subprocess.run(['gh', 'release', 'view', tag, '--repo', repo],
-                                capture_output=True, timeout=min(30, self.remaining()))
-        if exists.returncode:
-            gh('release', 'create', tag, '--repo', repo, '--target', os.environ['GITHUB_SHA'],
-               '--title', 'Recorder backup ' + run, '--notes', 'Opt-in recording backup; repository access rules apply.')
-        parts = split_for_release(source, work / 'parts', timeout=min(300, self.remaining()))
-        uploaded = []
-        for index, part in enumerate(parts):
-            if not 0 < part.stat().st_size < RELEASE_LIMIT:
-                raise PublishError('release_part_over_size_cap')
-            asset = work / f'{metadata["sha256"][:20]}-part-{index:05d}.ts'
-            os.link(part, asset)
-            gh('release', 'upload', tag, str(asset), '--repo', repo, '--clobber')
-            details = json.loads(gh('release', 'view', tag, '--repo', repo, '--json', 'assets'))
-            info = next((a for a in details.get('assets', []) if a.get('name') == asset.name), {})
-            link = info.get('browser_download_url') or info.get('url')
-            if info.get('size') != asset.stat().st_size or not link:
-                raise PublishError('release_asset_size_verification_failed')
-            if info.get('digest') and info['digest'] != 'sha256:' + fingerprints(asset, self.end)['sha256']:
-                raise PublishError('release_asset_digest_verification_failed')
-            uploaded.append({'provider': 'github_release', 'url': link,
-                             'bytes': asset.stat().st_size, 'verification': 'asset_size_and_digest_if_available'})
-            # Checkpoint successful parts even if a later upload fails.
-            self.results[-1]['receipts'] = list(uploaded)
-            self.save()
-        return uploaded
+    def release(self, *args, **kwargs):
+        raise PublishError('public_backup_disabled')
+
+    def verified_prior(self, metadata):
+        # A cached success is reused only after checking the remote Drive object again.
+        for prior in self.prior:
+            if not isinstance(prior,dict) or not prior.get('uploaded') or prior.get('sha256')!=metadata['sha256']:
+                continue
+            for receipt in prior.get('receipts',[]):
+                if receipt.get('provider')!='google_drive' or not self.drive_config:
+                    continue
+                remote=receipt.get('remote_path','')
+                if not remote.startswith(self.drive_prefix.rstrip('/')+'/'):
+                    continue
+                try:
+                    info=run_provider(['rclone','--config',self.drive_config,'lsjson',remote,'--stat','--hash'],
+                                        capture_output=True,text=True,timeout=min(30,self.remaining()))
+                    data=json.loads(info.stdout)
+                    hashes={k.lower():str(v).lower() for k,v in data.get('Hashes',{}).items()}
+                    if info.returncode==0 and data.get('Size')==metadata['bytes'] and hashes.get('md5')==metadata['md5']:
+                        return prior
+                except (OSError,ValueError,subprocess.TimeoutExpired):
+                    pass
+        return None
+
+    def resolve_session_url(self):
+        if not self.drive_config:return
+        safety_receipts=[c.get('receipt',{}) for c in self.rolling.get('clips',[]) if c.get('status')=='uploaded']
+        attempted=set()
+        for record in self.results + [{'receipts':safety_receipts}]:
+            for receipt in record.get('receipts',[]):
+                path=receipt.get('session_path')
+                if receipt.get('provider')!='google_drive' or not path or path in attempted:continue
+                attempted.add(path)
+                try:
+                    result=run_provider(['rclone','--config',self.drive_config,'lsjson',path,'--stat'],
+                                          capture_output=True,text=True,timeout=min(20,self.remaining()))
+                    data=json.loads(result.stdout);folder=data.get('ID','')
+                    # Older rclone synthesizes --stat directory entries without IDs.
+                    if not folder:
+                        parent,name=path.rsplit('/',1)
+                        listing=run_provider(['rclone','--config',self.drive_config,'lsjson',parent,'--dirs-only','--max-depth','1'],
+                                               capture_output=True,text=True,timeout=min(20,self.remaining()))
+                        entries=json.loads(listing.stdout)
+                        data=next((entry for entry in entries if entry.get('Name')==name and entry.get('IsDir')), {}) if listing.returncode==0 else {}
+                        folder=data.get('ID','')
+                    if data.get('IsDir') and re.fullmatch(r'[A-Za-z0-9_-]+',folder):
+                        self.session_url='https://drive.google.com/drive/folders/'+folder
+                        return
+                except (OSError,ValueError,PublishError,subprocess.TimeoutExpired):pass
 
     def run(self):
         candidates = select_media(self.root)
         self.save()
+        seen = {}
         for path in candidates:
             record = {'file': str(path.relative_to(self.root)), 'uploaded': False, 'receipts': []}
             self.results.append(record)
@@ -260,26 +355,29 @@ class Publisher:
                 metadata = fingerprints(path, self.end)
                 self.remaining()
                 record.update(metadata)
+                previous=seen.get(metadata['sha256'])
+                if previous and previous.get('uploaded'):
+                    record.update(uploaded=True,receipts=previous['receipts'],duplicate_of=previous['file'])
+                    self.save()
+                    print('DEDUPLICATED '+record['file'],flush=True)
+                    continue
+                previous=self.verified_prior(metadata)
+                if previous:
+                    record.update(uploaded=True,receipts=previous['receipts'],resumed=True)
+                    seen[metadata['sha256']]=record
+                    self.save()
+                    continue
                 # Safe ASCII multipart filename; hard-link avoids another multi-GB copy.
                 with tempfile.TemporaryDirectory(prefix='.upload-work-', dir=path.parent) as directory:
                     work = Path(directory)
                     staged = work / (metadata['sha256'][:20] + '.ts')
                     os.link(path, staged)
-                    receipts = None
-                    if self.drive_config:
-                        try:
-                            receipts = [self.google_drive(path, metadata)]
-                        except (PublishError, OSError, ValueError, subprocess.TimeoutExpired):
-                            record['drive_attempt_failed'] = True
-                            self.save()
-                    if receipts is None:
-                        try:
-                            receipts = [self.gofile(staged, metadata)]
-                        except (PublishError, subprocess.TimeoutExpired):
-                            if not self.release_fallback:
-                                raise PublishError('gofile_failed_source_preserved') from None
-                            receipts = self.release(path, metadata, work)
+                    # This deployment has one authorized destination: Drive.
+                    # An unavailable Drive never sends recordings to a public
+                    # provider or to repository Release assets.
+                    receipts = [self.google_drive(path, metadata)]
                     record.update(uploaded=True, receipts=receipts)
+                    seen[metadata["sha256"]]=record
                     self.save()
                 # Keep source on disk even after upload; lifecycle cleanup is explicit.
                 print('UPLOADED ' + record['file'], flush=True)
@@ -287,11 +385,11 @@ class Publisher:
                 record['error'] = str(error) if isinstance(error, PublishError) else type(error).__name__
                 print('UPLOAD_FAILED ' + record['file'] + ': ' + record['error'], flush=True)
             self.save()
+        self.resolve_session_url()
+        self.save()
         if not candidates:
-            print('NO_RECORDING: channel was offline during this shift; no files to upload.', flush=True)
-            self.save()
-            return 0
-        return 0 if (self.results and all(r['uploaded'] for r in self.results)) else 1
+            print('NO_RECORDING: no media files; this is not capture success', flush=True)
+        return 0 if self.results and all(r['uploaded'] for r in self.results) else 1
 
 
 def main():

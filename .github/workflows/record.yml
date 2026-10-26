@@ -1,45 +1,31 @@
 name: YouTube Live Recorder
 run-name: Recorder session ${{ inputs.session_id || github.run_id }} / shift ${{ inputs.shift_index || 0 }}
-
 on:
   workflow_dispatch:
     inputs:
       total_hours:
-        description: 'Hours from your manual start: 8, 9, 10, or 12 (max 14; use 0.05 for a short test)'
-        required: true
-        default: 9
+        description: Bounded recording session hours, maximum 14
         type: number
-
+        default: 9
       release_backup:
-        description: 'Backup failed Gofile uploads to GitHub Releases (public in public repos)'
-        required: true
-        default: true
+        description: Backup failed uploads to GitHub Releases
+        required: false
+        default: false
         type: boolean
       session_start:
-        description: 'Internal; leave empty for a fresh start'
-        required: false
-        default: ''
         type: string
+        default: ''
       session_id:
-        description: 'Internal; leave empty for a fresh start'
-        required: false
-        default: ''
         type: string
+        default: ''
       shift_index:
-        description: 'Internal; leave zero for a fresh start'
-        required: false
-        default: 0
         type: number
-
+        default: 0
 permissions:
   contents: read
-
-# Duplicate dispatches for one window serialize; expired windows are skipped.
-# Different window indexes may overlap as intended.
 concurrency:
   group: recorder-${{ github.workflow }}-${{ inputs.session_id || github.run_id }}-${{ inputs.shift_index || 0 }}
   cancel-in-progress: false
-
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -57,24 +43,6 @@ jobs:
       matrix: ${{ steps.channels.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
-      - name: Require a usable cookie file before starting any shifts
-        env:
-          YT_COOKIES: ${{ secrets.YT_COOKIES }}
-        run: |
-          python3 - <<'PYCODE'
-          import os
-          raw = os.environ.pop('YT_COOKIES', '')
-          good = False
-          for line in raw.splitlines():
-              if line.startswith('#HttpOnly_'): line = line[len('#HttpOnly_'):]
-              if not line or line.startswith('#'): continue
-              fields = line.split('\t')
-              domain = fields[0].lstrip('.').lower()
-              if len(fields) >= 7 and (domain == 'youtube.com' or domain.endswith('.youtube.com')) and fields[-1]: good = True
-          raw = ''
-          if not good: raise SystemExit('YT_COOKIES is missing or malformed. Add the complete private cookie file in repository Actions secrets; no continuation shifts started.')
-          print('Private cookie file binding found; values withheld. Authentication still depends on YouTube.')
-          PYCODE
       - name: Plan bounded session
         id: plan
         env:
@@ -83,30 +51,23 @@ jobs:
           SESSION_ID: ${{ inputs.session_id }}
           SHIFT_INDEX: ${{ inputs.shift_index }}
         run: python3 shift_plan.py
-      - name: Validate exactly one channel
+      - name: Validate one channel
         id: channels
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          with open('channels.json', encoding='utf-8-sig') as f:
-              channels = json.load(f)
-          if not isinstance(channels, list) or len(channels) != 1:
-              raise SystemExit('channels.json must contain exactly one channel')
-          item = channels[0]
-          if not isinstance(item, dict) or not isinstance(item.get('handle'), str) or not item['handle'].startswith('@'):
-              raise SystemExit('A channel @handle is required')
-          if item.get('id') and not isinstance(item['id'], str):
-              raise SystemExit('Channel id must be a string or empty')
-          print('matrix=' + json.dumps({'channel': channels}, separators=(',', ':')))
+          import json,re
+          channels=json.load(open('channels.json',encoding='utf-8-sig'))
+          if not isinstance(channels,list) or len(channels)!=1: raise SystemExit('Exactly one configured channel required')
+          item=channels[0]
+          if not isinstance(item,dict) or not re.fullmatch(r'@[A-Za-z0-9_.-]{1,100}',item.get('handle','')): raise SystemExit('Invalid channel handle')
+          if item.get('id') and not re.fullmatch(r'UC[A-Za-z0-9_-]{22}',item['id']): raise SystemExit('Invalid channel identity')
+          print('matrix='+json.dumps({'channel':channels},separators=(',',':')))
           PY
-
   record:
     needs: prepare
     if: needs.prepare.outputs.active == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    permissions:
-      contents: write  # Required for the enabled Release backup.
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
@@ -119,63 +80,72 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Install dependencies and show actual free disk
-        timeout-minutes: 15
+      - name: Install pinned capture dependency and fast static tools
+        timeout-minutes: 4
         run: |
           set -euo pipefail
-          missing=()
-          for executable in ffmpeg curl rclone; do
-            if ! command -v "$executable" >/dev/null; then missing+=("$executable"); fi
-          done
-          if ((${#missing[@]})); then
-            sudo apt-get -o Acquire::Retries=3 update -qq
-            sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 "${missing[@]}"
+          if ! command -v ffmpeg >/dev/null; then
+            curl -fsSL https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | sudo tar -xJ --strip-components=2 -C /usr/local/bin --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
           fi
-          python -m pip install -q 'yt-dlp[default,curl-cffi]==2026.10.21'
+          if ! command -v rclone >/dev/null; then
+            curl -fsSL https://downloads.rclone.org/v1.68.2/rclone-v1.68.2-linux-amd64.deb -o /tmp/rclone.deb
+            sudo dpkg -i /tmp/rclone.deb
+            rm -f /tmp/rclone.deb
+          fi
+          timeout --kill-after=10s 120s python -m pip install --disable-pip-version-check --no-input -q 'yt-dlp[default,curl-cffi]==2026.10.21' 'streamlink==8.6.2'
+          python -m yt_dlp --version
+          node --version
+          rclone version
           df -h .
-      - name: Record current window
-
+      - name: Capture with verified Drive safety clips
         id: capture
-        timeout-minutes: 190
+        timeout-minutes: 195
         continue-on-error: true
         env:
           CHANNEL_HANDLE: ${{ matrix.channel.handle }}
           TARGET_CHANNEL_ID: ${{ matrix.channel.id }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
+          RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
+          GDRIVE_REMOTE: ${{ vars.GDRIVE_REMOTE || 'drive:YouTubeRecordings' }}
+          RECORDING_SESSION_ID: ${{ needs.prepare.outputs.session_id }}
+          RECORDING_SHIFT_INDEX: ${{ inputs.shift_index || 0 }}
           SESSION_DEADLINE: ${{ needs.prepare.outputs.window_deadline }}
           OUT_DIR: streams
+          FORMAT_SELECTOR: best[height<=1440][protocol*=m3u8]/best[protocol*=m3u8]/best
+          CAPTURE_TRANSPORT: streamlink_hls
+          SKIP_DEPENDENCY_INSTALL: 'true'
+          SAFETY_CLIP_SECONDS: '300'
+          SAFETY_CLIP_OVERLAP: '15'
         run: |
           set -euo pipefail
-          cookie_path="$RUNNER_TEMP/youtube-recording-cookies.txt"
+          umask 077
+          cookie_path="$RUNNER_TEMP/recorder-private-cookies.txt"
           trap 'rm -f "$cookie_path"' EXIT
-          if [[ -z "$YT_COOKIES" ]]; then
-            echo '::error::YT_COOKIES is missing; refusing to claim an authenticated test.'
-            exit 2
-          fi
-          python3 -c "import os; open('$cookie_path', 'w', encoding='utf-8', newline='\n').write(os.environ.get('YT_COOKIES', '').lstrip('\ufeff'))"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          value=os.environ.get('YT_COOKIES','').lstrip('\ufeff')
+          if not value.strip(): raise SystemExit('Missing protected YT_COOKIES binding')
+          p=Path(os.environ['RUNNER_TEMP'])/'recorder-private-cookies.txt'
+          p.write_text(value,encoding='utf-8');p.chmod(0o600)
+          PY
           export USE_COOKIES=true COOKIE_FILE="$cookie_path"
           unset YT_COOKIES
           HOURS="$(python shift_plan.py --duration-until "$SESSION_DEADLINE")"
           export HOURS
-          python recorder.py
-      - name: Upload to Drive first, then Gofile and Release fallback
+          python capture_session.py
+      - name: Publish recovered media to Drive
         id: publish
         if: always() && steps.capture.outcome != 'skipped'
-        timeout-minutes: 122
+        timeout-minutes: 35
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ github.token }}
-          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
-          GOFILE_FOLDER_ID: ${{ vars.GOFILE_FOLDER_ID }}
           RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
           GDRIVE_REMOTE: ${{ vars.GDRIVE_REMOTE || 'drive:YouTubeRecordings' }}
-          RELEASE_BACKUP: ${{ inputs.release_backup }}
-        run: |
-          set -euo pipefail
-          args=()
-          if [[ "$RELEASE_BACKUP" == true ]]; then args+=(--release-fallback); fi
-          python run_upload.py --root streams --report upload-report.json --budget 7200 "${args[@]}"
-      - name: Save small diagnostics and verified upload receipts
+          RECORDING_SESSION_ID: ${{ needs.prepare.outputs.session_id }}
+          RECORDING_SHIFT_INDEX: ${{ inputs.shift_index || 0 }}
+        run: python run_upload.py --root streams --report upload-report.json --budget 1800 --allow-confirmed-offline
+      - name: Save sanitized recording summaries and verified receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -183,57 +153,33 @@ jobs:
           path: |
             upload-report.json
             streams/**/*_summary.json
+            streams/rolling-backup.json
+            streams/capture-guard.json
           if-no-files-found: warn
-          retention-days: 2
-      - name: Optional Telegram text notification
-        if: always()
-        timeout-minutes: 2
-        continue-on-error: true
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          RECORD_OUTCOME: ${{ steps.capture.outcome }}
-          CHANNEL_HANDLE: ${{ matrix.channel.handle }}
-        run: python notify_telegram.py
-      - name: Report actual recording and publication status
+          retention-days: 3
+      - name: Require truthful recording and upload outcome
         if: always()
         env:
           CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
           UPLOAD_OUTCOME: ${{ steps.publish.outcome }}
         run: |
           python - <<'PY'
-          import glob, json, os, pathlib
-          lines = ['Recording step: ' + os.environ['CAPTURE_OUTCOME'], 'Upload step: ' + os.environ['UPLOAD_OUTCOME']]
-          path = pathlib.Path('upload-report.json')
-          report = json.loads(path.read_text()) if path.exists() else {}
-          files = report.get('files', [])
-          summary_files = glob.glob('streams/**/*_summary.json', recursive=True)
-          summary = {}
-          if summary_files:
-              try:
-                  summary = json.loads(pathlib.Path(summary_files[0]).read_text(encoding='utf-8'))
-              except Exception:
-                  pass
-          if not files:
-              if os.environ['CAPTURE_OUTCOME'] == 'success':
-                  lines.append('🟢 Shift complete: Streamer was genuinely offline throughout this window. No recording needed.')
-              else:
-                  reason = summary.get('failure_reason') or 'YouTube blocked probes or live capture failed'
-                  lines.append(f'🔴 Shift FAILED: 0 bytes recorded. YouTube error: {reason}')
-          else:
-              for item in files:
-                  status_str = 'uploaded' if item.get('uploaded') else 'FAILED'
-                  lines.append(f"{item['file']}: {status_str}")
-                  lines.extend(r.get('url', '') for r in item.get('receipts', []))
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as stream:
-              stream.write('\n\n'.join(lines) + '\n')
-          if os.environ['CAPTURE_OUTCOME'] != 'success' or os.environ['UPLOAD_OUTCOME'] != 'success':
-              raise SystemExit('Recording or upload step failed with an error.')
-          if files and not report.get('all_uploaded'):
-              raise SystemExit('Some recorded stream files failed to upload.')
+          import glob,json,os,pathlib
+          p=pathlib.Path('upload-report.json')
+          report=json.loads(p.read_text()) if p.exists() else {}
+          summaries=[]
+          for f in glob.glob('streams/**/*_summary.json',recursive=True):
+              try:summaries.append(json.loads(pathlib.Path(f).read_text()))
+              except (ValueError,OSError):pass
+          files=report.get('files',[])
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out:
+              out.write('Capture step: '+os.environ['CAPTURE_OUTCOME']+'\n\n')
+              out.write('Media files submitted: '+str(len(files))+'\n\n')
+              for s in summaries:out.write('Observation: '+str(s.get('observation_status',s.get('status','UNKNOWN')))+'\n\n')
+          if os.environ['CAPTURE_OUTCOME']!='success' or os.environ['UPLOAD_OUTCOME']!='success':raise SystemExit('Capture or publication incomplete; inspect sanitized evidence')
+          if files and not report.get('all_uploaded'):raise SystemExit('Unverified uploads remain')
+          if not files and not any(str(s.get('observation_status','')).lower()=='offline' for s in summaries):raise SystemExit('No valid media and no explicit offline observation')
           PY
-
-
   next-shift:
     needs: prepare
     if: needs.prepare.outputs.chain == 'true'
@@ -244,7 +190,7 @@ jobs:
       actions: write
     steps:
       - uses: actions/checkout@v4
-      - name: Dispatch next overlapping window
+      - name: Request next overlapping bounded window
         env:
           GH_TOKEN: ${{ github.token }}
           WORKFLOW_REF: ${{ github.ref_name }}
@@ -254,5 +200,5 @@ jobs:
           NEXT_INDEX: ${{ needs.prepare.outputs.next_index }}
           NEXT_AT: ${{ needs.prepare.outputs.next_at }}
           DEADLINE: ${{ needs.prepare.outputs.deadline }}
-          RELEASE_BACKUP: ${{ inputs.release_backup }}
+          WORKFLOW_FILE: record.yml
         run: python3 chain_shift.py

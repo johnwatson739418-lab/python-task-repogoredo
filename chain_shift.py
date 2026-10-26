@@ -9,9 +9,9 @@ import urllib.request
 
 def dispatch_body():
     return {'ref': os.environ['WORKFLOW_REF'], 'inputs': {
-        'total_hours': os.environ['TOTAL_HOURS'], 'session_start': os.environ['SESSION_START'],
-        'session_id': os.environ['SESSION_ID'], 'shift_index': os.environ['NEXT_INDEX'],
-        'release_backup': os.environ.get('RELEASE_BACKUP', 'false')}}
+        'total_hours': str(os.environ['TOTAL_HOURS']), 'release_backup': 'false',
+        'session_start': str(os.environ['SESSION_START']),
+        'session_id': str(os.environ['SESSION_ID']), 'shift_index': str(os.environ['NEXT_INDEX'])}}
 
 
 def main():

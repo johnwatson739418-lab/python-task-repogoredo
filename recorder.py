@@ -3,7 +3,9 @@ YouTube Live Recorder -- Cloud Runner Engine
 """
 
 import atexit
+import contextlib
 import glob
+import importlib.util
 import json
 import os
 import re
@@ -13,6 +15,7 @@ import socket
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,12 +38,6 @@ if not 0 < HOURS <= 5.0:
 OUT_DIR = os.getenv("OUT_DIR", "./streams").strip()
 
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.txt").strip()
-if COOKIE_FILE and os.path.isfile(COOKIE_FILE):
-    try:
-        raw_cookie = open(COOKIE_FILE, "r", encoding="utf-8-sig").read().lstrip("\ufeff")
-        open(COOKIE_FILE, "w", encoding="utf-8", newline="\n").write(raw_cookie)
-    except Exception:
-        pass
 
 USE_COOKIES = (
     os.getenv("USE_COOKIES", "false").lower() == "true"
@@ -51,9 +48,9 @@ USE_COOKIES = (
 
 FORMAT_SELECTOR = os.getenv(
     "FORMAT_SELECTOR",
-    "b[height<=1080][height>=480][protocol*=m3u8]/b[height<=720][protocol*=m3u8]/b[protocol*=m3u8]/b[height<=1080][height>=480]/b[height<=720]/b",
+    "bv*[height<=1080]+ba/b[height<=1080]/bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
 )
-SORT_EXPR = "res:720,fps,br"
+SORT_EXPR = "res:1080,fps,br"
 
 PRIMARY_RECHECK_SECONDS = 25
 ACTIVE_SESSION_RECHECK_SECONDS = 120
@@ -67,7 +64,7 @@ HEARTBEAT_SECONDS = 15
 POLL_INTERVAL_SECONDS = 2
 STALL_SECONDS = int(os.getenv("STALL_SECONDS", "120"))
 OFFLINE_GRACE_SECONDS = 180
-FAILURE_COOLDOWN_SECONDS = 15
+FAILURE_COOLDOWN_SECONDS = 30
 
 FATAL_ERRORS_COUNT = 0
 LAST_FATAL_ERROR = None
@@ -75,11 +72,69 @@ FATAL_ERROR_LOCK = threading.Lock()
 LIVE_DETECTED_EVER = False
 
 
+AUTH_BLOCKED = threading.Event()
+PROBE_OBSERVATION_LOCK = threading.Lock()
+PROBE_OBSERVATIONS = {"live": 0, "offline": 0, "unknown": 0}
+
+
+def record_probe_observation(state):
+    with PROBE_OBSERVATION_LOCK:
+        PROBE_OBSERVATIONS[state] += 1
+
+
 def record_fatal_error(reason):
-    global FATAL_ERRORS_COUNT, LAST_FATAL_ERROR
+    global FATAL_ERRORS_COUNT, LAST_FATAL_ERROR, STOP_REQUESTED
     with FATAL_ERROR_LOCK:
         FATAL_ERRORS_COUNT += 1
         LAST_FATAL_ERROR = str(reason)
+    if reason in {"botcheck", "rate_limited", "invalid_cookies", "unavailable"}:
+        # A denied account/source is not a reason to rotate extraction clients.
+        AUTH_BLOCKED.set()
+        STOP_REQUESTED = True
+
+
+@contextlib.contextmanager
+def private_cookie_copy():
+    """Each child owns a 0600 jar; the original exported jar is never rewritten."""
+    path = None
+    try:
+        if USE_COOKIES:
+            fd, path = tempfile.mkstemp(prefix="recorder-cookie-", suffix=".txt")
+            try:
+                os.chmod(path, 0o600)
+                target = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+                fd = None  # fd ownership transferred; never double-close after source failure.
+                with target:
+                    with open(COOKIE_FILE, "r", encoding="utf-8-sig") as source:
+                        target.write(source.read())
+            finally:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+        yield path
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+
+def observation_result(saved_paths):
+    """Return a truthful outcome for this observation window, including partial failures."""
+    if AUTH_BLOCKED.is_set():
+        return ("partial_failed" if saved_paths else "failed", LAST_FATAL_ERROR or "auth_blocked", 2)
+    if saved_paths:
+        return ("recorded", None, 0)
+    if LIVE_DETECTED_EVER or FATAL_ERRORS_COUNT:
+        return ("failed", LAST_FATAL_ERROR or "live_detected_but_zero_bytes", 2)
+    with PROBE_OBSERVATION_LOCK:
+        counts = dict(PROBE_OBSERVATIONS)
+    if counts["unknown"] or not counts["offline"]:
+        return ("unknown", "observation_incomplete", 2)
+    return ("offline", None, 0)
 
 
 
@@ -89,13 +144,13 @@ COPY_BUFFER_BYTES = 8 * 1024 * 1024
 
 SHORT_EXIT_PROTECTION_SECONDS = 90
 SHORT_EXIT_RETRIES = 2
-SHORT_EXIT_BACKOFF_SECONDS = 4
+SHORT_EXIT_BACKOFF_SECONDS = 30
 STALL_RETRY_BACKOFF_SECONDS = 4
 CLIENT_SWITCH_DELAY_SECONDS = 5
 
-# Candidate order; use the probe workflow to validate clients on your runner.
-DOWNLOAD_CLIENTS = [None, "web", "web_safari"]
-VALIDATION_CLIENTS = [None, "web"]
+# Use yt-dlp default client selection; never rotate clients after denial.
+DOWNLOAD_CLIENTS = [None]
+VALIDATION_CLIENTS = [None]
 
 SESSION_ACTIVE = threading.Event()
 DOWNLOAD_ACTIVE = threading.Event()
@@ -182,6 +237,7 @@ def normalize_message(value):
 
 
 BOTCHECK_MARKERS = ["sign in to confirm you're not a bot", "confirm you're not a bot"]
+INVALID_COOKIE_MARKERS = ["cookies are no longer valid", "cookies have expired", "cookies are invalid"]
 NO_FORMAT_MARKERS = ["no video formats found", "requested format is not available"]
 RATE_LIMIT_MARKERS = ["http error 403", "http error 429", "try again later", "too many requests"]
 NOT_LIVE_MARKERS = ["the channel is not currently live", "this live event will begin", "this live event has ended"]
@@ -218,6 +274,16 @@ def command_exists(name):
 
 
 def install_dependencies():
+    if os.getenv("SKIP_DEPENDENCY_INSTALL", "false").lower() == "true":
+        required = [name for name in ("curl", "ffmpeg", "ffprobe") if not command_exists(name)]
+        if not any(command_exists(name) for name in ("deno", "node", "nodejs")):
+            required.append("javascript_runtime")
+        if importlib.util.find_spec("yt_dlp") is None:
+            required.append("yt_dlp")
+        if required:
+            raise SystemExit("Pre-provisioned dependencies missing: " + ",".join(required))
+        log("dependencies_preprovisioned | no runtime package installation")
+        return
     log(f"installing dependencies for {CHANNEL_HANDLE} (cookies={USE_COOKIES})")
     try:
         subprocess.run(
@@ -259,11 +325,13 @@ def install_dependencies():
 
 
 def js_runtime_args():
-    args = ["--remote-components", "ejs:github"]
-    if command_exists("node"):
+    args = []
+    if command_exists("deno"):
+        args += ["--js-runtimes", "deno"]
+    elif command_exists("node"):
         args += ["--js-runtimes", "node"]
     elif command_exists("nodejs"):
-        args += ["--js-runtimes", "nodejs"]
+        args += ["--js-runtimes", "node:" + shutil.which("nodejs")]
     return args
 
 
@@ -271,23 +339,23 @@ JS_ARGS = js_runtime_args()
 
 
 def fetch_text(url):
+    if AUTH_BLOCKED.is_set():
+        return ""
     curl_bin = shutil.which("curl")
     if not curl_bin:
         return ""
-
     cmd = [
         curl_bin, "-s", "-L", "--compressed", "--max-time", str(HTML_TIMEOUT_SECONDS),
-        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "-H", "User-Agent: Mozilla/5.0",
         "-H", "Accept-Language: en-US,en;q=0.9",
     ]
-    if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE):
-        cmd += ["-b", COOKIE_FILE]
-    cmd.append(url)
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=HTML_TIMEOUT_SECONDS + 2
-        )
+        with private_cookie_copy() as cookie_path:
+            if cookie_path:
+                cmd += ["-b", cookie_path]
+            cmd.append(url)
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                    errors="replace", timeout=HTML_TIMEOUT_SECONDS + 2)
         if result.returncode == 0 and result.stdout:
             return result.stdout
     except Exception:
@@ -385,75 +453,165 @@ def is_live_candidate(info):
     return bool(info.get("is_live") or live_status == "is_live")
 
 
-def run_ytdlp_json(url, client):
-    command = [
-        sys.executable, "-m", "yt_dlp", "--no-config", "-J",
-        "--skip-download", "--no-warnings", "--ignore-no-formats-error",
-        "--playlist-items", "1",
-    ] + JS_ARGS
+def extraction_error_reason(stderr):
+    message = normalize_message(stderr)
+    groups = (("invalid_cookies", INVALID_COOKIE_MARKERS), ("botcheck", BOTCHECK_MARKERS),
+              ("rate_limited", RATE_LIMIT_MARKERS), ("no_formats", NO_FORMAT_MARKERS),
+              ("unavailable", UNAVAILABLE_MARKERS), ("not_live", NOT_LIVE_MARKERS))
+    return next((reason for reason, markers in groups if any(m in message for m in markers)), None)
 
+
+def register_owned_process(process, kind):
+    """Allow the capture wrapper to clean groups if this recorder is hard-killed."""
+    registry = os.environ.get("RECORDER_PROCESS_REGISTRY", "")
+    if not registry or os.name != "posix":
+        return
+    directory = os.path.abspath(registry)
+    if not os.path.isdir(directory) or os.path.islink(directory):
+        raise RuntimeError("invalid_owned_process_registry")
+    pid = process.pid
+    if not isinstance(pid, int) or pid <= 1 or os.getpgid(pid) != pid:
+        raise RuntimeError("capture_process_group_not_owned")
+    with open(f"/proc/{pid}/stat", encoding="utf-8") as stat_file:
+        fields = stat_file.read().rsplit(")", 1)[1].split()
+    ticks = int(fields[19])  # /proc stat field22; comm may contain spaces/parentheses.
+    fd, temporary = tempfile.mkstemp(prefix=".register-", dir=directory)
+    destination = os.path.join(directory, f"{pid}-{ticks}.json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as target:
+            json.dump({"pid": pid, "proc_start_ticks": ticks, "kind": kind}, target)
+        os.replace(temporary, destination)
+        process._recorder_registry_path = destination
+    finally:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def bounded_metadata_run(command, *, timeout):
+    """Reap yt-dlp and its JS descendants before its private cookie jar is removed."""
+    process = subprocess.Popen(command, text=True, encoding="utf-8", errors="replace",
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=(os.name == "posix"))
+    process._recorder_owned_group = (os.name == "posix")
+    try:
+        register_owned_process(process, "metadata")
+        stdout, stderr = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    finally:
+        stop_proc(process)
+        for stream in (process.stdout, process.stderr):
+            if stream:
+                stream.close()
+
+
+def run_ytdlp_json(url, client):
+    global LIVE_DETECTED_EVER
+    if AUTH_BLOCKED.is_set():
+        return None
+    command = [
+        sys.executable, "-m", "yt_dlp", "--no-config", "--no-cache-dir", "-J",
+        "--skip-download", "--socket-timeout", "15", "--retries", "1",
+        "--extractor-retries", "1", "--playlist-items", "1",
+    ] + JS_ARGS
     if client:
         command += ["--extractor-args", f"youtube:player_client={client}"]
-    if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE):
-        command += ["--cookies", COOKIE_FILE]
-    command.append(url)
-
+    log(f"ytdlp_exec | client={client_label(client)} | source=metadata")
     try:
-        result = subprocess.run(
-            command, text=True, encoding="utf-8", errors="replace",
-            capture_output=True, timeout=PROBE_TIMEOUT_SECONDS
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            raw = json.loads(result.stdout)
-            if raw.get("_type") == "playlist" and raw.get("entries"):
-                for item in raw["entries"]:
-                    if item and is_live_candidate(item):
-                        global LIVE_DETECTED_EVER
-                        LIVE_DETECTED_EVER = True
-                        return item
-                return raw["entries"][0]
-            if is_live_candidate(raw):
-                LIVE_DETECTED_EVER = True
-            return raw
+        with private_cookie_copy() as cookie_path:
+            if cookie_path:
+                command += ["--cookies", cookie_path]
+            command.append(url)
+            result = bounded_metadata_run(command, timeout=PROBE_TIMEOUT_SECONDS)
+        log(f"ytdlp_done | client={client_label(client)} | exit={result.returncode}")
+        reason = extraction_error_reason(result.stderr)
+        # Check access errors even when yt-dlp returned partial JSON with exit 0.
+        if reason == "unavailable" and url != LIVE_URL:
+            # An old discovery/RSS item may be private after its live ended.
+            # It is not evidence that the account or current live endpoint is blocked.
+            log("candidate_rejected | reason=unavailable")
+            return None
+        if reason in {"invalid_cookies", "botcheck", "rate_limited", "unavailable", "no_formats"}:
+            record_fatal_error(reason)
+            log(f"probe_failed | client={client_label(client)} | reason={reason}")
+            return None
         if result.returncode:
-            message = normalize_message(result.stderr)
-            reason = "botcheck" if any(marker in message for marker in BOTCHECK_MARKERS) else (
-                "rate_limited" if any(marker in message for marker in RATE_LIMIT_MARKERS) else (
-                "no_formats" if any(marker in message for marker in NO_FORMAT_MARKERS) else (
-                "unavailable" if any(marker in message for marker in UNAVAILABLE_MARKERS) else (
-                "not_live" if any(marker in message for marker in NOT_LIVE_MARKERS) else "extraction_failed"))))
-            err_snip = " ".join(result.stderr.split())[:180]
-            log(f"probe_failed | client={client_label(client)} | reason={reason} | exit={result.returncode} | err={err_snip}")
-            if reason in {"botcheck", "rate_limited", "no_formats", "unavailable", "extraction_failed"}:
-                record_fatal_error(reason)
-
+            if reason == "not_live" and url == LIVE_URL:
+                record_probe_observation("offline")
+                return {"live_status": "not_live", "_observation": "offline"}
+            else:
+                record_probe_observation("unknown")
+            log(f"probe_failed | client={client_label(client)} | reason={reason or 'extraction_failed'}")
+            return None
+        raw = json.loads(result.stdout)
+        if not isinstance(raw, dict):
+            raise ValueError("metadata_not_object")
+        if raw.get("_type") == "playlist":
+            entries = [item for item in raw.get("entries", []) if isinstance(item, dict)]
+            raw = next((item for item in entries if is_live_candidate(item)), entries[0] if entries else {})
+        status = str(raw.get("live_status") or "").casefold()
+        if is_live_candidate(raw):
+            formats = [item for item in (raw.get("formats") or [])
+                       if isinstance(item, dict) and str(item.get("url") or "").startswith(("https://", "http://"))
+                       and str(item.get("protocol") or "").lower() != "mhtml"
+                       and str(item.get("ext") or "").lower() not in {"mhtml", "jpg", "jpeg", "png", "webp"}]
+            has_video = any(item.get("vcodec") not in {None, "none", "images"} for item in formats)
+            has_audio = any(item.get("acodec") not in {None, "none"} for item in formats)
+            if not (has_video and has_audio):
+                record_probe_observation("unknown")
+                log("probe_incomplete | reason=no_playable_formats")
+                return None
+            LIVE_DETECTED_EVER = True
+            record_probe_observation("live")
+            return raw
+        if url == LIVE_URL and status in {"not_live", "was_live", "post_live", "is_upcoming"}:
+            record_probe_observation("offline")
+            return raw
+        record_probe_observation("unknown")
+        log("probe_incomplete | reason=live_status_unknown")
     except subprocess.TimeoutExpired:
+        record_probe_observation("unknown")
         log(f"probe_failed | client={client_label(client)} | reason=timeout")
     except Exception as exc:
+        record_probe_observation("unknown")
         log(f"probe_failed | client={client_label(client)} | reason={type(exc).__name__}")
     return None
 
 
 def extract_live_badge_ids(html):
+    """Parse complete JSON renderer objects; badges never bleed across siblings."""
     if not html:
         return []
-    scores = {}
-    patterns = [r'"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"', r'watch\?v=([A-Za-z0-9_-]{11})', r'shorts/([A-Za-z0-9_-]{11})']
-    for pattern in patterns:
-        for match in re.finditer(pattern, html, flags=re.IGNORECASE):
-            video_id = match.group(1)
-            context = html[max(0, match.start() - 1500):min(len(html), match.end() + 1500)].lower()
-            score = scores.get(video_id, 0)
-            if any(k in context for k in ("islivenow", "is_live_now", "badge_style_type_live_now", '"style":"live"')):
-                score += 10
-            if re.search(r'"label"\s*:\s*"live"', context) or re.search(r'"text"\s*:\s*"live"', context):
-                score += 5
-            if "watching" in context:
-                score += 2
-            scores[video_id] = score
-
-    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    return [video_id for video_id, score in ranked if score >= 5]
+    decoder = json.JSONDecoder()
+    found = []
+    renderer = re.compile(r'"(?:videoRenderer|compactVideoRenderer|gridVideoRenderer)"\s*:\s*(?=\{)')
+    def live_badge(value):
+        if isinstance(value, dict):
+            if value.get("isLiveNow") is True or value.get("is_live_now") is True:
+                return True
+            if value.get("style") in {"BADGE_STYLE_TYPE_LIVE_NOW", "LIVE"}:
+                return True
+            if value.get("label") == "LIVE" or value.get("text") == "LIVE":
+                return True
+            return any(live_badge(v) for k, v in value.items()
+                       if k not in {"videoRenderer", "compactVideoRenderer", "gridVideoRenderer"})
+        if isinstance(value, list):
+            return any(live_badge(v) for v in value)
+        return False
+    for match in renderer.finditer(html):
+        try:
+            item, _ = decoder.raw_decode(html, match.end())
+        except (ValueError, RecursionError):
+            continue
+        video_id = item.get("videoId") if isinstance(item, dict) else None
+        scoped_badge = isinstance(item, dict) and (
+            item.get("isLiveNow") is True or item.get("is_live_now") is True
+            or any(live_badge(item.get(key)) for key in ("badges", "thumbnailOverlays")))
+        if isinstance(video_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id) and scoped_badge:
+            if video_id not in found:
+                found.append(video_id)
+    return found
 
 
 def extract_rss_video_ids(xml):
@@ -465,10 +623,13 @@ def extract_rss_video_ids(xml):
 def validate_candidate(video_id, client):
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
     info = run_ytdlp_json(watch_url, client)
-    if not info or not is_live_candidate(info):
+    if not info:
+        log(f"validate_candidate | vid={video_id} | client={client_label(client)} | no_info")
         return None
+    is_live = is_live_candidate(info)
     matched, reason = target_match(info)
-    if not matched:
+    log(f"validate_candidate | vid={video_id} | client={client_label(client)} | is_live={is_live} | matched={matched} ({reason})")
+    if not is_live or not matched:
         return None
     return {"id": video_id, "url": watch_url, "client": client, "match_reason": reason}
 
@@ -479,73 +640,51 @@ def verify_live_id(video_id, source_kind):
         return None
 
     started = time.monotonic()
-    executor = ThreadPoolExecutor(max_workers=len(VALIDATION_CLIENTS))
-    futures = {executor.submit(validate_candidate, video_id, client): client for client in VALIDATION_CLIENTS}
-    result = None
+    for client in VALIDATION_CLIENTS:
+        if AUTH_BLOCKED.is_set():
+            return None
+        candidate = validate_candidate(video_id, client)
+        if candidate:
+            global LIVE_DETECTED_EVER
+            LIVE_DETECTED_EVER = True
+            elapsed = time.monotonic() - started
+            log(f"detect_live | source={source_kind} | live id={candidate['id']} | client={client_label(client)} | match={candidate['match_reason']} | validation={elapsed:.1f}s")
+            return {"id": candidate["id"], "url": candidate["url"], "source": source_kind, "detected_client": client}
 
-    try:
-        for future in as_completed(futures, timeout=PROBE_TIMEOUT_SECONDS + 2):
-            try:
-                candidate = future.result()
-            except Exception:
-                candidate = None
-            if candidate:
-                result = candidate
-                break
-    except Exception:
-        pass
-    finally:
-        executor.shutdown(wait=False)
-
-    if result:
-        global LIVE_DETECTED_EVER
-        LIVE_DETECTED_EVER = True
-        elapsed = time.monotonic() - started
-        log(f"detect_live | source={source_kind} | live id={result['id']} | client={client_label(result['client'])} | match={result['match_reason']} | validation={elapsed:.1f}s")
-        return {"id": result["id"], "url": result["url"], "source": source_kind, "detected_client": result["client"]}
     return None
 
 
 def probe_fast():
-    executor = ThreadPoolExecutor(max_workers=3)
-    futures = {
-        executor.submit(fetch_text, CHANNEL_URL): "home",
-        executor.submit(run_ytdlp_json, LIVE_URL, None): "default_live",
-        executor.submit(run_ytdlp_json, LIVE_URL, "web_safari"): "web_live",
-    }
-    home_html = ""
-    live_infos = {}
-
-    try:
-        for future in as_completed(futures, timeout=PROBE_TIMEOUT_SECONDS + 4):
-            kind = futures[future]
-            try:
-                value = future.result()
-            except Exception:
-                value = None
-            if kind == "home":
-                home_html = value or ""
-            else:
-                live_infos[kind] = value
-    except Exception:
-        pass
-    finally:
-        executor.shutdown(wait=False)
-
-    for key, client in (("default_live", None), ("web_live", "web_safari")):
-        info = live_infos.get(key)
-        if not info or not is_live_candidate(info):
-            continue
+    log(f"probe_fast_start | LIVE_URL={LIVE_URL}")
+    info = run_ytdlp_json(LIVE_URL, None)
+    if not info:
+        log("probe_fast | ytdlp returned no info")
+    else:
+        if str(info.get("live_status") or "").casefold() in {"not_live", "was_live", "post_live", "is_upcoming"}:
+            return None
+        video_id = info.get("id")
+        is_live = is_live_candidate(info)
         matched, reason = target_match(info)
-        if not matched:
-            continue
-        video_id = info["id"]
-        LIVE_DETECTED_EVER = True
-        log(f"detect_live | source=live_endpoint | live id={video_id} | client={client} | match={reason}")
-        return {"id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}", "source": "live_endpoint", "detected_client": client}
+        log(f"probe_fast_eval | id={video_id} | is_live={is_live} | live_status={info.get('live_status')} | matched={matched} ({reason})")
+        if is_live and matched:
+            global LIVE_DETECTED_EVER
+            LIVE_DETECTED_EVER = True
+            log(f"detect_live | source=live_endpoint | live id={video_id} | client=default | match={reason}")
+            return {"id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}", "source": "live_endpoint", "detected_client": None}
 
+        # If info gave a video ID (e.g. from channel tab entry where live_status is omitted), verify its watch URL directly
+        if video_id and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+            result = verify_live_id(video_id, "live_endpoint_watch")
+            if result:
+                return result
 
-    for video_id in extract_live_badge_ids(home_html)[:2]:
+    if AUTH_BLOCKED.is_set():
+        return None
+    # Fallback to channel home page if direct live endpoint was inconclusive
+    home_html = fetch_text(CHANNEL_URL)
+    badge_ids = extract_live_badge_ids(home_html)
+    log(f"probe_fast_fallback | badge_ids={badge_ids}")
+    for video_id in badge_ids[:2]:
         result = verify_live_id(video_id, "home_live_badge")
         if result:
             return result
@@ -553,6 +692,8 @@ def probe_fast():
 
 
 def probe_secondary():
+    if AUTH_BLOCKED.is_set():
+        return None
     channel_id = TARGET.get("channel_id")
     if not channel_id:
         return None
@@ -595,23 +736,52 @@ def probe_secondary():
 def stop_proc(process):
     if not process:
         return
-    try:
-        if process.poll() is not None:
-            return
-        # Let yt-dlp close its active fragment before falling back to termination.
-        process.send_signal(signal.SIGINT)
-        process.wait(timeout=20)
-        return
-    except Exception:
+    owned_group = bool(getattr(process, "_recorder_owned_group", False))
+    pid = getattr(process, "pid", None)
+    owned_group = owned_group and isinstance(pid, int) and pid > 1 and os.name == "posix"
+    group_cleanup_done = False
+    def send(signum):
+        nonlocal group_cleanup_done
         try:
-            process.terminate()
-            process.wait(timeout=5)
-            return
-        except Exception:
+            if owned_group:
+                os.killpg(pid, signum)
+                if signum == signal.SIGKILL:
+                    group_cleanup_done = True
+            elif process.poll() is None:
+                process.send_signal(signum)
+        except ProcessLookupError:
+            if owned_group:
+                group_cleanup_done = True
+        except OSError:
+            pass
+    try:
+        if process.poll() is None:
+            send(signal.SIGINT)
             try:
-                process.kill()
-                process.wait(timeout=5)
-            except Exception:
+                process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                send(signal.SIGTERM)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    send(signal.SIGKILL)
+                    process.wait(timeout=5)
+    except Exception:
+        send(signal.SIGKILL)
+    finally:
+        # The leader may have exited while an ffmpeg descendant is still alive.
+        # Only a capture process explicitly created by us owns this group.
+        if owned_group:
+            send(signal.SIGKILL)
+        try:
+            process.wait(timeout=2)
+        except Exception:
+            pass
+        registry_path = getattr(process, "_recorder_registry_path", None)
+        if owned_group and group_cleanup_done and isinstance(registry_path, str):
+            try:
+                os.remove(registry_path)
+            except FileNotFoundError:
                 pass
 
 
@@ -665,7 +835,7 @@ def save_active_state(active):
 
 
 def chunk_number(path):
-    match = re.search(r"_chunk(\d+)\.ts(?:\.part)?$", os.path.basename(path))
+    match = re.search(r"_chunk(\d+)", os.path.basename(path))
     return int(match.group(1)) if match else 0
 
 
@@ -682,7 +852,14 @@ def register_recovered_chunks(active):
     known = set(registered)
     recovered = []
 
-    candidates = glob.glob(os.path.join(active["chunk_dir"], "*.ts")) + glob.glob(os.path.join(active["chunk_dir"], "*.ts.part"))
+    candidates = [
+        p for p in (
+            glob.glob(os.path.join(active["chunk_dir"], "*.ts*"))
+            + glob.glob(os.path.join(active["chunk_dir"], "*.mp4*"))
+            + glob.glob(os.path.join(active["chunk_dir"], "*.mkv*"))
+        )
+        if not is_archived_short_exit(p)
+    ]
     for path in sorted(candidates, key=chunk_number):
         if is_archived_short_exit(path):
             continue
@@ -826,9 +1003,8 @@ def build_final_file(active):
             text=True, capture_output=True, timeout=180,
         )
         if result.returncode == 0 and os.path.isfile(final_path) and os.path.getsize(final_path) >= MIN_SAVE_BYTES:
-            for path in chunks:
-                try: os.remove(path)
-                except Exception: pass
+            # A successful mux/size check is not a verified remote receipt.
+            # Preserve every source chunk for independent recovery/publication.
             try: os.remove(list_path)
             except Exception: pass
             return final_path
@@ -872,11 +1048,11 @@ def output_reader(stream, output_state):
     for raw_line in iter(stream.readline, ""):
         if not raw_line:
             break
-        print(raw_line, end="", flush=True)
         lowered = normalize_message(raw_line)
-        if "chosen=" in raw_line or "error:" in lowered or "warning:" in lowered:
-            log_raw("yt_dlp", raw_line)
-        output_state["botcheck"] |= any(marker in lowered for marker in BOTCHECK_MARKERS)
+        if "chosen=" in raw_line:
+            safe = re.sub(r"https?://\S+", "[URL]", raw_line.strip())
+            log_raw("yt_dlp_format", safe[:300])
+        output_state["botcheck"] |= any(marker in lowered for marker in BOTCHECK_MARKERS + INVALID_COOKIE_MARKERS)
         output_state["no_formats"] |= any(marker in lowered for marker in NO_FORMAT_MARKERS)
         output_state["rate_limited"] |= any(marker in lowered for marker in RATE_LIMIT_MARKERS)
         output_state["not_live"] |= any(marker in lowered for marker in NOT_LIVE_MARKERS)
@@ -891,21 +1067,38 @@ def classify_output(output_state):
     return "normal_end" if output_state["normal_exit"] else "no_file"
 
 
-def make_download_cmd(active, chunk_path, client):
+def make_download_cmd(active, chunk_path, client, cookie_path=None):
+    transport = os.getenv("CAPTURE_TRANSPORT", "native").strip().lower()
+    if USE_COOKIES and not cookie_path:
+        raise RuntimeError("private_cookie_path_required")
+    if transport == "streamlink_hls":
+        helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hls_capture.py")
+        if not os.path.isfile(helper):
+            raise RuntimeError("hls_capture_helper_missing")
+        command = [sys.executable, helper, "--url", active["live_url"], "--output", chunk_path,
+                   "--format", FORMAT_SELECTOR, "--client", client_label(client)]
+        if cookie_path:
+            command += ["--cookies", cookie_path]
+        return command
+    if transport != "native":
+        raise RuntimeError("unsupported_capture_transport")
     command = [
         sys.executable, "-m", "yt_dlp", "--no-config", "--newline", "--no-warnings",
-        "--restrict-filenames", "--no-part", "--no-playlist", "--no-live-from-start",
+        "--socket-timeout", "15", "--restrict-filenames", "--no-part", "--no-playlist", "--no-live-from-start",
         "--print", "before_dl:chosen=%(format_id)s | %(resolution)s | tbr=%(tbr)s | protocol=%(protocol)s",
         "--retries", "20", "--extractor-retries", "20", "--file-access-retries", "20",
         "--fragment-retries", "infinite", "--retry-sleep", "http:2", "--retry-sleep", "fragment:1",
         "--skip-unavailable-fragments", "--hls-use-mpegts", "--downloader", "m3u8:native", "-N", "1",
         "-f", FORMAT_SELECTOR, "-S", SORT_EXPR, "-o", chunk_path,
-    ] + JS_ARGS
+    ]
 
+    command += JS_ARGS
     if client:
         command += ["--extractor-args", f"youtube:player_client={client}"]
-    if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE):
-        command += ["--cookies", COOKIE_FILE]
+    if USE_COOKIES and not cookie_path:
+        raise RuntimeError("private_cookie_path_required")
+    if cookie_path:
+        command += ["--cookies", cookie_path]
     command.append(active["live_url"])
     return command
 
@@ -913,8 +1106,16 @@ def make_download_cmd(active, chunk_path, client):
 def current_saved_path(base_path):
     if os.path.isfile(base_path):
         return base_path
-    part_path = base_path + ".part"
-    return part_path if os.path.isfile(part_path) else None
+    for ext in (".part", ".mp4", ".ts.mp4", ".mkv", ".webm"):
+        candidate = base_path + ext
+        if os.path.isfile(candidate):
+            return candidate
+    base_no_ext = os.path.splitext(base_path)[0]
+    for ext in (".mp4", ".ts", ".mkv", ".webm"):
+        candidate = base_no_ext + ext
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def finalize_download_path(base_path):
@@ -974,23 +1175,36 @@ def drain_latest_candidate(live_queue):
 
 
 def run_download_attempt(active, session_end, client, live_queue):
+    if AUTH_BLOCKED.is_set():
+        return False, LAST_FATAL_ERROR or "auth_blocked", None
+    with private_cookie_copy() as cookie_path:
+        return _run_download_attempt(active, session_end, client, live_queue, cookie_path)
+
+
+def _run_download_attempt(active, session_end, client, live_queue, cookie_path):
     global CURRENT_PROC, STOP_REQUESTED, DISK_LIMIT_REACHED
     index = active["chunk_index"]
     chunk_path = build_chunk_path(active, index)
     active["recording_path"] = chunk_path
     save_active_state(active)
 
-    command = make_download_cmd(active, chunk_path, client)
+    command = make_download_cmd(active, chunk_path, client, cookie_path)
     left = max(0, session_end - time.time())
     log(f"[{hms(left)} left] download_started | chunk={index:04d} | client={client_label(client)}")
 
+    process = None
     try:
         process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            start_new_session=(os.name == "posix"),
         )
+        process._recorder_owned_group = (os.name == "posix")
+        register_owned_process(process, "capture")
     except Exception as exc:
-        log_raw("download_launch_error", exc)
+        if process is not None:
+            stop_proc(process)
+        log_raw("download_launch_error", type(exc).__name__)
         active["recording_path"] = None
         save_active_state(active)
         if "record_fatal_error" in globals() and callable(globals()["record_fatal_error"]):
@@ -1018,6 +1232,10 @@ def run_download_attempt(active, session_end, client, live_queue):
         while process.poll() is None and time.time() < session_end and not STOP_REQUESTED:
             time.sleep(POLL_INTERVAL_SECONDS)
             now = time.time()
+            if output_state["botcheck"] or output_state["rate_limited"] or output_state["unavailable"]:
+                stop_reason = "access_denied"
+                stop_proc(process)
+                break
             if shutil.disk_usage(OUT_DIR).free < MIN_FREE_BYTES:
                 DISK_LIMIT_REACHED = True
                 STOP_REQUESTED = True
@@ -1046,8 +1264,7 @@ def run_download_attempt(active, session_end, client, live_queue):
                 stop_proc(process)
                 break
     finally:
-        if process.poll() is None:
-            stop_proc(process)
+        stop_proc(process)
         with CURRENT_PROC_LOCK:
             CURRENT_PROC = None
         DOWNLOAD_ACTIVE.clear()
@@ -1333,20 +1550,22 @@ def main():
     if DISK_LIMIT_REACHED:
         raise SystemExit(3)
     saved_paths = [
-        path for path in glob.glob(os.path.join(OUT_DIR, "**", "*.ts"), recursive=True)
-        if os.path.getsize(path) >= MIN_SAVE_BYTES
+        path for path in (
+            glob.glob(os.path.join(OUT_DIR, "**", "*.ts"), recursive=True)
+            + glob.glob(os.path.join(OUT_DIR, "**", "*.mp4"), recursive=True)
+            + glob.glob(os.path.join(OUT_DIR, "**", "*.mkv"), recursive=True)
+        )
+        if os.path.isfile(path) and os.path.getsize(path) >= MIN_SAVE_BYTES and not path.endswith(".part")
     ]
 
-    if not saved_paths:
-        if LIVE_DETECTED_EVER or FATAL_ERRORS_COUNT > 0:
-            failure_reason = LAST_FATAL_ERROR or ("live_detected_but_zero_bytes" if LIVE_DETECTED_EVER else "probe_blocked")
-            log(f"recording_failed | stream was detected or requests blocked by YouTube: reason={failure_reason} (fatal_errors={FATAL_ERRORS_COUNT}, live_detected={LIVE_DETECTED_EVER}). Exiting with code 2.")
-            write_summary(status="failed", failure_reason=failure_reason)
-            sys.exit(2)
-        else:
-            log("no_recording_saved | channel was offline during this shift; monitoring window completed cleanly without blocks.")
-            write_summary(status="offline", failure_reason=None)
-            sys.exit(0)
+    status, failure_reason, exit_code = observation_result(saved_paths)
+    with PROBE_OBSERVATION_LOCK:
+        counts = dict(PROBE_OBSERVATIONS)
+    write_summary(status=status, failure_reason=failure_reason,
+                  observation_status=status, probe_observations=counts,
+                  saved_file_count=len(saved_paths), media_saved=bool(saved_paths))
+    log(f"window_result | status={status} | saved_files={len(saved_paths)} | reason={failure_reason or 'none'}")
+    raise SystemExit(exit_code)
 
 
 

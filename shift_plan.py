@@ -5,8 +5,8 @@ import math
 import os
 import time
 
-STEP = 2 * 3600
-WINDOW = 3 * 3600
+STEP = int(os.environ.get('SHIFT_STEP_SECONDS') or 2 * 3600)
+WINDOW = int(os.environ.get('SHIFT_WINDOW_SECONDS') or 3 * 3600)
 
 
 def plan(start, total_hours, now, index=0):
