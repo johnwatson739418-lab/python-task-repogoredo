@@ -51,7 +51,7 @@ def main():
         return 0
     value = os.environ.pop('RCLONE_CONFIG_TEXT', '')
     child_env = os.environ.copy()
-    for key in ('GH_TOKEN', 'GITHUB_TOKEN', 'GOFILE_TOKEN', 'GOFILE_FOLDER_ID',
+    for key in ('GH_TOKEN', 'GITHUB_TOKEN',
                 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'YT_COOKIES'):
         child_env.pop(key, None)
     with tempfile.TemporaryDirectory(prefix='private-upload-config-') as directory:

@@ -216,8 +216,66 @@ class Publisher:
         temporary.write_text(json.dumps(value, indent=2))
         os.replace(temporary, self.report)
 
-    def gofile(self, *args, **kwargs):
-        raise PublishError('public_backup_disabled')
+    def gofile(self, source, metadata):
+        seconds = min(900, self.remaining())
+        if seconds < 10:
+            raise PublishError('gofile_upload_budget_exhausted')
+        token = os.environ.get('GOFILE_TOKEN', '').strip()
+        folder_id = os.environ.get('GOFILE_FOLDER_ID', '').strip()
+        command = [
+            'curl', '--silent', '--show-error', '--fail-with-body',
+            '--connect-timeout', '20', '--max-time', str(int(seconds)),
+            '--form', f'file=@{source}'
+        ]
+        if token:
+            command += ['--form', f'token={token}']
+        if folder_id:
+            command += ['--form', f'folderId={folder_id}']
+        command.append(GOFILE_ENDPOINT)
+        try:
+            result = run_provider(command, capture_output=True, text=True, timeout=min(seconds + 10, self.remaining()))
+        except (subprocess.TimeoutExpired, OSError) as e:
+            raise PublishError(f'gofile_transport_error: {e}')
+        if result.returncode != 0:
+            raise PublishError(f'gofile_curl_failed_rc_{result.returncode}')
+        try:
+            payload = json.loads(result.stdout or '{}')
+        except json.JSONDecodeError:
+            raise PublishError('gofile_invalid_json_response')
+        if payload.get('status') != 'ok':
+            raise PublishError(f'gofile_rejected_status_{payload.get("status")}')
+        data = payload.get('data') or {}
+        link = data.get('downloadPage') or data.get('link') or ''
+        if not (isinstance(link, str) and link.startswith('https://')):
+            raise PublishError('gofile_missing_download_link')
+        file_id = data.get('fileId', '') or data.get('id', '')
+        print(f'GOFILE_FALLBACK_SUCCESS: {source.name} -> {link}', flush=True)
+        return {
+            'provider': 'gofile',
+            'url': link,
+            'download_page': link,
+            'file_id': file_id,
+            'verification': 'status_ok_and_link',
+            'bytes': metadata.get('bytes', source.stat().st_size)
+        }
+
+    def upload_candidate(self, source, metadata):
+        errors = []
+        # Primary: Google Drive
+        try:
+            return self.google_drive(source, metadata)
+        except Exception as drive_err:
+            errors.append(f"drive: {drive_err}")
+            print(f"GOOGLE_DRIVE_FAILED for {source.name}: {drive_err}; falling back to Gofile...", flush=True)
+
+        # Fallback: Gofile
+        try:
+            return self.gofile(source, metadata)
+        except Exception as gofile_err:
+            errors.append(f"gofile: {gofile_err}")
+            print(f"GOFILE_FALLBACK_FAILED for {source.name}: {gofile_err}", flush=True)
+
+        raise PublishError("all_upload_providers_failed: " + "; ".join(errors))
 
     def google_drive(self, source, metadata):
         if not self.drive_config or not Path(self.drive_config).is_file():
@@ -372,10 +430,8 @@ class Publisher:
                     work = Path(directory)
                     staged = work / (metadata['sha256'][:20] + '.ts')
                     os.link(path, staged)
-                    # This deployment has one authorized destination: Drive.
-                    # An unavailable Drive never sends recordings to a public
-                    # provider or to repository Release assets.
-                    receipts = [self.google_drive(path, metadata)]
+                    # Primary: Drive, Fallback: Gofile
+                    receipts = [self.upload_candidate(path, metadata)]
                     record.update(uploaded=True, receipts=receipts)
                     seen[metadata["sha256"]]=record
                     self.save()

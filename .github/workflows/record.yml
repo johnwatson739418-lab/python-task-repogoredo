@@ -125,6 +125,8 @@ jobs:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
           RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
           GDRIVE_REMOTE: ${{ vars.GDRIVE_REMOTE || 'drive:YouTubeRecordings' }}
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+          GOFILE_FOLDER_ID: ${{ secrets.GOFILE_FOLDER_ID }}
           RECORDING_SESSION_ID: ${{ needs.prepare.outputs.session_id }}
           RECORDING_SHIFT_INDEX: ${{ inputs.shift_index || 0 }}
           SESSION_DEADLINE: ${{ needs.prepare.outputs.window_deadline }}
@@ -161,6 +163,8 @@ jobs:
         env:
           RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
           GDRIVE_REMOTE: ${{ vars.GDRIVE_REMOTE || 'drive:YouTubeRecordings' }}
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+          GOFILE_FOLDER_ID: ${{ secrets.GOFILE_FOLDER_ID }}
           RECORDING_SESSION_ID: ${{ needs.prepare.outputs.session_id }}
           RECORDING_SHIFT_INDEX: ${{ inputs.shift_index || 0 }}
         run: python run_upload.py --root streams --report upload-report.json --budget 1800 --allow-confirmed-offline

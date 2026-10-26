@@ -146,7 +146,7 @@ class SafetyArchive:
         publisher=Publisher(self.work,self.work/'unused-report.json',budget=90)
         publisher.category='safety'
         publisher.drive_config=self.config or ''
-        return publisher.google_drive(path,metadata)
+        return publisher.upload_candidate(path,metadata)
 
     def upload_index(self, receipt):
         if not self.config or receipt.get('provider')!='google_drive':return
