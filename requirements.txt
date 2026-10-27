@@ -1,2 +1,2 @@
-yt-dlp[default,curl-cffi]==2026.10.21
-streamlink==8.6.2
+yt-dlp[default,curl-cffi]
+requests>=2.31.0

@@ -1,54 +1,88 @@
-"""Optional bounded text notification. Never log Telegram URLs or error bodies."""
-import json
+#!/usr/bin/env python3
+"""
+Real-time Telegram notifications for God-level YouTube Live Recorder.
+Events: live_detected, fallback_mode, upload_done, shift_failed, info
+"""
+
+from __future__ import annotations
+
 import os
-from pathlib import Path
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
+import requests
+from typing import Optional
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+ENABLED = bool(BOT_TOKEN and CHAT_ID)
 
 
-def chunks(text, size=3500):
-    for offset in range(0, len(text), size):
-        yield text[offset:offset + size]
-
-
-def main():
-    token = os.environ.get('TELEGRAM_BOT_TOKEN')
-    chat = os.environ.get('TELEGRAM_CHAT_ID')
-    if not token or not chat:
-        print('Telegram not configured; skipping optional notification')
-        return
-    record_outcome = os.environ.get('RECORD_OUTCOME', 'unknown')
-    lines = [f'YouTube recorder: {os.environ.get("CHANNEL_HANDLE", "unknown")}',
-             f'Recording step: {record_outcome}']
-    try:
-        report = json.loads(Path('upload-report.json').read_text())
-        lines.append('All uploads confirmed: ' + str(report.get('all_uploaded', False)))
-        if not report.get('files'):
-            lines.append('No recording files found.')
-        for entry in report.get('files', []):
-            lines.append(f'{entry["file"]}: {"uploaded" if entry["uploaded"] else "FAILED"}')
-            lines += [r['url'] for r in entry.get('receipts', [])]
-    except (OSError, ValueError):
-        lines.append('Upload report unavailable; inspect workflow logs.')
-    if os.environ.get('GITHUB_SERVER_URL') and os.environ.get('GITHUB_REPOSITORY'):
-        lines.append(f'{os.environ["GITHUB_SERVER_URL"]}/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{os.environ.get("GITHUB_RUN_ID", "")}')
-    end = time.monotonic() + 90
-    for part in chunks('\n'.join(lines)):
-        left = end - time.monotonic()
-        if left <= 0:
-            raise SystemExit('Telegram notification time budget exceeded')
-        body = urllib.parse.urlencode({'chat_id': chat, 'text': part}).encode()
-        request = urllib.request.Request(f'https://api.telegram.org/bot{token}/sendMessage', data=body)
+def _send(text: str, parse_mode: str = "HTML", disable_preview: bool = True) -> bool:
+    if not ENABLED:
+        return False
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text[:4000],
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": disable_preview,
+    }
+    for attempt in range(3):
         try:
-            with urllib.request.urlopen(request, timeout=min(20, left)) as response:
-                if not json.load(response).get('ok'):
-                    raise SystemExit('Telegram rejected notification; response withheld')
-        except (urllib.error.URLError, TimeoutError, ValueError):
-            raise SystemExit('Telegram notification failed; raw error withheld') from None
-    print('Telegram text notification sent')
+            r = requests.post(url, json=payload, timeout=15)
+            if r.status_code == 200:
+                return True
+            time.sleep(1.5 * (attempt + 1))
+        except Exception:
+            time.sleep(1.5 * (attempt + 1))
+    return False
 
 
-if __name__ == '__main__':
-    main()
+def live_detected(handle: str, video_id: str, client: str) -> None:
+    msg = (
+        f"🔴 <b>LIVE DETECTED</b>\n"
+        f"Channel: <code>{handle}</code>\n"
+        f"Video ID: <code>{video_id}</code>\n"
+        f"Client: <code>{client}</code>\n"
+        f"https://www.youtube.com/watch?v={video_id}"
+    )
+    _send(msg)
+
+
+def fallback_mode(handle: str, reason: str) -> None:
+    msg = (
+        f"⚠️ <b>FALLBACK MODE</b>\n"
+        f"Channel: <code>{handle}</code>\n"
+        f"Reason: {reason}\n"
+        f"Using pure mobile clients (no cookies)."
+    )
+    _send(msg)
+
+
+def upload_done(handle: str, video_id: str, size_gb: float, links: list[str]) -> None:
+    links_txt = "\n".join(f"• {u}" for u in links[:8]) if links else "• (no public links)"
+    msg = (
+        f"✅ <b>UPLOAD COMPLETE</b>\n"
+        f"Channel: <code>{handle}</code>\n"
+        f"Video: <code>{video_id}</code>\n"
+        f"Size: <b>{size_gb:.2f} GB</b>\n\n"
+        f"{links_txt}"
+    )
+    _send(msg)
+
+
+def shift_failed(handle: str, reason: str, shift_index: int = 0) -> None:
+    msg = (
+        f"❌ <b>SHIFT FAILED</b>\n"
+        f"Channel: <code>{handle}</code>\n"
+        f"Shift: #{shift_index}\n"
+        f"Reason: {reason}"
+    )
+    _send(msg)
+
+
+def info(text: str) -> None:
+    _send(f"ℹ️ {text}")
+
+
+if __name__ == "__main__":
+    info("Telegram notify module test OK")

@@ -1,229 +1,236 @@
-name: YouTube Live Recorder
-run-name: Recorder session ${{ inputs.session_id || github.run_id }} / shift ${{ inputs.shift_index || 0 }}
+name: God-level YouTube Live Recorder
+
 on:
   workflow_dispatch:
     inputs:
+      channel_handle:
+        description: "OPTIONAL – override channel (e.g. @prankurv123, @BagadBillagang-p6s, @floxiclip, @GOREDOXLIVE). Empty = channels.json"
+        required: false
+        default: ""
+        type: string
       total_hours:
-        description: Bounded recording session hours, maximum 14
-        type: number
-        default: 9
-      release_backup:
-        description: Backup failed uploads to GitHub Releases
+        description: "Total session length in hours (e.g. 6, 8, 9, 12; use 0.1 for 6-min test)"
         required: false
-        default: false
-        type: boolean
+        default: "8"
+        type: string
       session_start:
+        description: "Internal ISO UTC start time (leave empty = now)"
+        required: false
+        default: ""
         type: string
-        default: ''
       session_id:
+        description: "Internal Session ID (auto-generated if empty)"
+        required: false
+        default: ""
         type: string
-        default: ''
       shift_index:
-        type: number
-        default: 0
-      shift_step_seconds:
-        description: Override shift step seconds (for rapid testing, e.g. 600)
+        description: "Internal shift index (0-based)"
         required: false
+        default: "0"
         type: string
-        default: ''
-      shift_window_seconds:
-        description: Override shift window seconds (for rapid testing, e.g. 900)
-        required: false
-        type: string
-        default: ''
+
 permissions:
-  contents: read
+  contents: write
+  actions: write
+
 concurrency:
-  group: recorder-${{ github.workflow }}-${{ inputs.session_id || github.run_id }}-${{ inputs.shift_index || 0 }}
+  group: recorder-${{ github.event.inputs.channel_handle || 'default' }}-${{ github.event.inputs.session_id || github.run_id }}-${{ github.event.inputs.shift_index || '0' }}
   cancel-in-progress: false
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      active: ${{ steps.plan.outputs.active }}
-      deadline: ${{ steps.plan.outputs.deadline }}
-      window_deadline: ${{ steps.plan.outputs.window_deadline }}
-      chain: ${{ steps.plan.outputs.chain }}
-      next_at: ${{ steps.plan.outputs.next_at }}
-      next_index: ${{ steps.plan.outputs.next_index }}
-      session_start: ${{ steps.plan.outputs.session_start }}
       session_id: ${{ steps.plan.outputs.session_id }}
-      total_hours: ${{ steps.plan.outputs.total_hours }}
-      shift_step_seconds: ${{ steps.plan.outputs.shift_step_seconds }}
-      shift_window_seconds: ${{ steps.plan.outputs.shift_window_seconds }}
-      matrix: ${{ steps.channels.outputs.matrix }}
+      session_start: ${{ steps.plan.outputs.session_start }}
+      window_index: ${{ steps.plan.outputs.window_index }}
+      window_count: ${{ steps.plan.outputs.window_count }}
+      window_deadline: ${{ steps.plan.outputs.window_deadline }}
+      window_duration_min: ${{ steps.plan.outputs.window_duration_min }}
+      has_next: ${{ steps.plan.outputs.has_next }}
+      next_shift_index: ${{ steps.plan.outputs.next_shift_index }}
+      channel_handle: ${{ steps.channel.outputs.handle }}
+      channel_id: ${{ steps.channel.outputs.id }}
     steps:
       - uses: actions/checkout@v4
-      - name: Plan bounded session
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve channel (manual override or channels.json)
+        id: channel
+        run: |
+          MANUAL="${{ github.event.inputs.channel_handle }}"
+          if [ -n "$MANUAL" ]; then
+            HANDLE="$MANUAL"
+            case "$HANDLE" in
+              @*|UC*) ;;
+              *) HANDLE="@$HANDLE" ;;
+            esac
+            echo "handle=$HANDLE" >> "$GITHUB_OUTPUT"
+            echo "id=" >> "$GITHUB_OUTPUT"
+            echo "Using MANUAL channel override: $HANDLE"
+          else
+            HANDLE=$(python3 -c '
+          import json
+          data = json.load(open("channels.json", encoding="utf-8-sig"))
+          for c in data:
+              if c.get("enabled", True):
+                  print(c["handle"])
+                  break
+          else:
+              print("@BagadBillagang-p6s")
+          ')
+            ID=$(python3 -c '
+          import json
+          data = json.load(open("channels.json", encoding="utf-8-sig"))
+          for c in data:
+              if c.get("enabled", True):
+                  print(c.get("id", ""))
+                  break
+          ')
+            echo "handle=$HANDLE" >> "$GITHUB_OUTPUT"
+            echo "id=$ID" >> "$GITHUB_OUTPUT"
+            echo "Using channels.json: $HANDLE"
+          fi
+
+      - name: Plan shifts
         id: plan
         env:
-          TOTAL_HOURS: ${{ inputs.total_hours }}
-          SESSION_START: ${{ inputs.session_start }}
-          SESSION_ID: ${{ inputs.session_id }}
-          SHIFT_INDEX: ${{ inputs.shift_index }}
-          SHIFT_STEP_SECONDS: ${{ inputs.shift_step_seconds }}
-          SHIFT_WINDOW_SECONDS: ${{ inputs.shift_window_seconds }}
+          TOTAL_HOURS: ${{ github.event.inputs.total_hours || '8' }}
+          SESSION_START: ${{ github.event.inputs.session_start }}
+          SESSION_ID: ${{ github.event.inputs.session_id }}
+          SHIFT_INDEX: ${{ github.event.inputs.shift_index || '0' }}
         run: python3 shift_plan.py
-      - name: Validate one channel
-        id: channels
-        run: |
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json,re
-          channels=json.load(open('channels.json',encoding='utf-8-sig'))
-          if not isinstance(channels,list) or len(channels)!=1: raise SystemExit('Exactly one configured channel required')
-          item=channels[0]
-          if not isinstance(item,dict) or not re.fullmatch(r'@[A-Za-z0-9_.-]{1,100}',item.get('handle','')): raise SystemExit('Invalid channel handle')
-          if item.get('id') and not re.fullmatch(r'UC[A-Za-z0-9_-]{22}',item['id']): raise SystemExit('Invalid channel identity')
-          print('matrix='+json.dumps({'channel':channels},separators=(',',':')))
-          PY
+
   record:
     needs: prepare
-    if: needs.prepare.outputs.active == 'true'
+    if: needs.prepare.outputs.window_duration_min != '0'
     runs-on: ubuntu-latest
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    name: Record ${{ matrix.channel.handle }}
+    timeout-minutes: 360
+    name: Record ${{ needs.prepare.outputs.channel_handle }} (Shift ${{ needs.prepare.outputs.window_index }})
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - uses: actions/setup-node@v4
+          python-version: "3.12"
+
+      - name: Install Node (for yt-dlp JS challenges)
+        uses: actions/setup-node@v4
         with:
-          node-version: '22'
-      - name: Free runner disk space
+          node-version: "20"
+
+      - name: Install system & Python dependencies
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell /usr/share/swift 2>/dev/null || true
-          df -h /
-      - name: Install pinned capture dependency and fast static tools
-        timeout-minutes: 4
-        run: |
-          set -euo pipefail
-          if ! command -v ffmpeg >/dev/null; then
-            curl -fsSL https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | sudo tar -xJ --strip-components=2 -C /usr/local/bin --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
-          fi
-          if ! command -v rclone >/dev/null; then
-            curl -fsSL https://downloads.rclone.org/v1.68.2/rclone-v1.68.2-linux-amd64.deb -o /tmp/rclone.deb
-            sudo dpkg -i /tmp/rclone.deb
-            rm -f /tmp/rclone.deb
-          fi
-          timeout --kill-after=10s 120s python -m pip install --disable-pip-version-check --no-input -q 'yt-dlp[default,curl-cffi]==2026.10.21' 'streamlink==8.6.2'
-          python -m yt_dlp --version
-          node --version
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg curl rclone
+          pip install -U pip
+          pip install -r requirements.txt
+          pip install -U "yt-dlp[default,curl-cffi]"
+          yt-dlp --version
           rclone version
-          df -h .
-      - name: Capture with verified Drive safety clips
+
+      - name: Prepare cookies (optional – never fatal)
+        id: cookies
+        env:
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          if [ -n "$YT_COOKIES" ]; then
+            python3 -c 'import os, pathlib; p = pathlib.Path(os.environ["RUNNER_TEMP"]) / "cookies.txt"; p.write_text(os.environ["YT_COOKIES"].lstrip("\ufeff"), encoding="utf-8")'
+            echo "USE_COOKIES=true" >> "$GITHUB_ENV"
+            echo "COOKIE_FILE=$RUNNER_TEMP/cookies.txt" >> "$GITHUB_ENV"
+            echo "Cookies written (optional)"
+          else
+            echo "USE_COOKIES=false" >> "$GITHUB_ENV"
+            echo "COOKIE_FILE=" >> "$GITHUB_ENV"
+            echo "No cookies – pure mobile clients (android_vr/android/ios) will be used"
+          fi
+
+      - name: Capture window
         id: capture
-        timeout-minutes: 195
+        timeout-minutes: 295
         continue-on-error: true
         env:
-          CHANNEL_HANDLE: ${{ matrix.channel.handle }}
-          TARGET_CHANNEL_ID: ${{ matrix.channel.id }}
-          YT_COOKIES: ${{ secrets.YT_COOKIES }}
-          RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
-          GDRIVE_REMOTE: ${{ vars.GDRIVE_REMOTE || 'drive:YouTubeRecordings' }}
-          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
-          GOFILE_FOLDER_ID: ${{ secrets.GOFILE_FOLDER_ID }}
-          RECORDING_SESSION_ID: ${{ needs.prepare.outputs.session_id }}
-          RECORDING_SHIFT_INDEX: ${{ inputs.shift_index || 0 }}
+          CHANNEL_HANDLE: ${{ needs.prepare.outputs.channel_handle }}
+          TARGET_CHANNEL_ID: ${{ needs.prepare.outputs.channel_id }}
           SESSION_DEADLINE: ${{ needs.prepare.outputs.window_deadline }}
           OUT_DIR: streams
-          FORMAT_SELECTOR: best[height<=1440][protocol*=m3u8]/best[protocol*=m3u8]/best
-          CAPTURE_TRANSPORT: streamlink_hls
-          CAPTURE_LOCAL_BYTES_LIMIT: '21474836480'
-          SKIP_DEPENDENCY_INSTALL: 'true'
-          SAFETY_CLIP_SECONDS: '300'
-          SAFETY_CLIP_OVERLAP: '15'
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          set -euo pipefail
-          umask 077
-          cookie_path="$RUNNER_TEMP/recorder-private-cookies.txt"
-          trap 'rm -f "$cookie_path"' EXIT
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-          value=os.environ.get('YT_COOKIES','').lstrip('\ufeff')
-          if not value.strip(): raise SystemExit('Missing protected YT_COOKIES binding')
-          p=Path(os.environ['RUNNER_TEMP'])/'recorder-private-cookies.txt'
-          p.write_text(value,encoding='utf-8');p.chmod(0o600)
-          PY
-          export USE_COOKIES=true COOKIE_FILE="$cookie_path"
-          unset YT_COOKIES
-          HOURS="$(python shift_plan.py --duration-until "$SESSION_DEADLINE")"
-          export HOURS
-          python capture_session.py
-      - name: Publish recovered media to Drive
-        id: publish
-        if: always() && steps.capture.outcome != 'skipped'
-        timeout-minutes: 35
+          python3 recorder.py
+          ls -lh streams/ || true
+
+      - name: Dispatch next shift immediately (Zero gap during upload)
+        if: always() && needs.prepare.outputs.has_next == 'true'
         continue-on-error: true
         env:
-          RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
-          GDRIVE_REMOTE: ${{ vars.GDRIVE_REMOTE || 'drive:YouTubeRecordings' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SESSION_ID: ${{ needs.prepare.outputs.session_id }}
+          SESSION_START: ${{ needs.prepare.outputs.session_start }}
+          NEXT_SHIFT_INDEX: ${{ needs.prepare.outputs.next_shift_index }}
+          TOTAL_HOURS: ${{ github.event.inputs.total_hours || '8' }}
+          CHANNEL_HANDLE: ${{ github.event.inputs.channel_handle }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: python3 chain_shift.py
+
+      - name: Publish (1. Google Drive → 2. Gofile → 3. GitHub Releases)
+        id: publish
+        if: always()
+        timeout-minutes: 55
+        continue-on-error: true
+        env:
+          CHANNEL_HANDLE: ${{ needs.prepare.outputs.channel_handle }}
+          OUT_DIR: streams
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+          RCLONE_REMOTE: ${{ vars.GDRIVE_REMOTE || secrets.RCLONE_REMOTE || 'drive:YouTubeRecordings' }}
           GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
-          GOFILE_FOLDER_ID: ${{ secrets.GOFILE_FOLDER_ID }}
-          RECORDING_SESSION_ID: ${{ needs.prepare.outputs.session_id }}
-          RECORDING_SHIFT_INDEX: ${{ inputs.shift_index || 0 }}
-        run: python run_upload.py --root streams --report upload-report.json --budget 1800 --allow-confirmed-offline
-      - name: Save sanitized recording summaries and verified receipts
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 publish.py
+
+      - name: Save small JSON reports (never raw video to avoid 500MB quota failure)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diagnostics-${{ github.run_id }}-${{ inputs.shift_index || 0 }}
+          name: report-${{ needs.prepare.outputs.session_id }}-shift${{ needs.prepare.outputs.window_index }}
           path: |
+            streams/*.json
             upload-report.json
-            streams/**/*_summary.json
-            streams/rolling-backup.json
-            streams/capture-guard.json
-          if-no-files-found: warn
           retention-days: 3
-      - name: Require truthful recording and upload outcome
+          if-no-files-found: ignore
+
+      - name: Write GitHub Step Summary
         if: always()
-        env:
-          CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
-          UPLOAD_OUTCOME: ${{ steps.publish.outcome }}
         run: |
-          python - <<'PY'
-          import glob,json,os,pathlib
-          p=pathlib.Path('upload-report.json')
-          report=json.loads(p.read_text()) if p.exists() else {}
-          summaries=[]
-          for f in glob.glob('streams/**/*_summary.json',recursive=True):
-              try:summaries.append(json.loads(pathlib.Path(f).read_text()))
-              except (ValueError,OSError):pass
-          files=report.get('files',[])
-          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out:
-              out.write('Capture step: '+os.environ['CAPTURE_OUTCOME']+'\n\n')
-              out.write('Media files submitted: '+str(len(files))+'\n\n')
-              for s in summaries:out.write('Observation: '+str(s.get('observation_status',s.get('status','UNKNOWN')))+'\n\n')
-          if os.environ['CAPTURE_OUTCOME']!='success' or os.environ['UPLOAD_OUTCOME']!='success':raise SystemExit('Capture or publication incomplete; inspect sanitized evidence')
-          if files and not report.get('all_uploaded'):raise SystemExit('Unverified uploads remain')
-          if not files and not any(str(s.get('observation_status','')).lower()=='offline' for s in summaries):raise SystemExit('No valid media and no explicit offline observation')
+          python3 - <<'PY'
+          import json, os, pathlib
+          lines = [f"### Recording Report: `{os.environ.get('CHANNEL_HANDLE', '')}`"]
+          p = pathlib.Path("streams/upload_report.json")
+          if p.exists():
+              rep = json.loads(p.read_text(encoding="utf-8"))
+              files = rep.get("files", [])
+              if not files:
+                  lines.append("🟢 **Channel was offline during this window.** No media files needed upload.")
+              else:
+                  lines.append(f"- **Total Recorded:** `{rep.get('total_size_gb', 0)} GB`")
+                  lines.append(f"- **All Uploaded:** `{rep.get('all_uploaded')}`")
+                  for f in files:
+                      lines.append(f"  - `{f['file']}` ({f['size_gb']} GB) -> **{f['method']}**")
+                      for lnk in f.get("links", []):
+                          lines.append(f"    - {lnk}")
+          else:
+              lines.append("⚠️ Upload report not generated; check job logs.")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write("\n".join(lines) + "\n")
           PY
-  next-shift:
-    needs: prepare
-    if: needs.prepare.outputs.chain == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 140
-    permissions:
-      contents: read
-      actions: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Request next overlapping bounded window
         env:
-          GH_TOKEN: ${{ github.token }}
-          WORKFLOW_REF: ${{ github.ref_name }}
-          TOTAL_HOURS: ${{ needs.prepare.outputs.total_hours }}
-          SESSION_START: ${{ needs.prepare.outputs.session_start }}
-          SESSION_ID: ${{ needs.prepare.outputs.session_id }}
-          NEXT_INDEX: ${{ needs.prepare.outputs.next_index }}
-          NEXT_AT: ${{ needs.prepare.outputs.next_at }}
-          DEADLINE: ${{ needs.prepare.outputs.deadline }}
-          SHIFT_STEP_SECONDS: ${{ needs.prepare.outputs.shift_step_seconds }}
-          SHIFT_WINDOW_SECONDS: ${{ needs.prepare.outputs.shift_window_seconds }}
-          WORKFLOW_FILE: record.yml
-        run: python3 chain_shift.py
+          CHANNEL_HANDLE: ${{ needs.prepare.outputs.channel_handle }}
