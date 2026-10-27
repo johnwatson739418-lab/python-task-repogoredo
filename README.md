@@ -22,8 +22,8 @@ Production-ready multi-shift YouTube live stream recorder for GitHub Actions.
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `RCLONE_CONFIG` | Recommended | Full rclone.conf content (auto-detects remote name e.g. `[drive]` or `[gdrive]`) |
-| `RCLONE_REMOTE` | Optional | Default `drive:YouTubeRecordings` (auto-corrected if section name differs) |
+| `RCLONE_CONFIG` | Recommended | Full rclone.conf content (or at least the `[gdrive]` section) |
+| `RCLONE_REMOTE` | Optional | Default `gdrive:YouTubeLive` |
 | `GOFILE_TOKEN` | Optional | Gofile API token (guest also works) |
 | `YT_COOKIES` | Optional | Netscape cookies.txt content |
 | `TELEGRAM_BOT_TOKEN` | Optional | Bot token |

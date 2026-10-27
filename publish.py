@@ -55,7 +55,7 @@ def resolve_rclone_config() -> Optional[Path]:
         tmp.write_text(raw_secret, encoding="utf-8")
         try:
             tmp.chmod(0o600)
-        except OSError:
+        except Exception:
             pass
         return tmp
 

@@ -2,7 +2,7 @@
 """
 Shift / session planner for GitHub Actions.
 Calculates overlapping recording windows under the 6-hour job limit.
-Outputs GitHub Actions outputs for the workflow.
+Supports adaptive splitting for short 1-hour tests (2 x 30 min shifts) as well as multi-hour sessions.
 """
 
 from __future__ import annotations
@@ -11,12 +11,10 @@ import json
 import os
 import sys
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 
-# Defaults
-MAX_WINDOW_MINUTES = 300          # 5 hours safe
-OVERLAP_MINUTES = 8               # small overlap between shifts
-DEFAULT_TOTAL_HOURS = 6
+MAX_WINDOW_MINUTES = 240          # 4 hours per shift (leaves 2 hours for upload under 6h GitHub limit)
+OVERLAP_MINUTES = 5               # overlap between shifts
+DEFAULT_TOTAL_HOURS = 8
 
 
 def now_utc() -> datetime:
@@ -39,23 +37,22 @@ def main() -> int:
     shift_index = int(os.getenv("SHIFT_INDEX", "0"))
 
     session_start = parse_iso(session_start_raw) or now_utc()
-    total_minutes = int(total_hours * 60)
+    total_minutes = max(4, int(round(total_hours * 60)))
 
-    # For testing short runs (<= 120 min), split into exactly 2 shifts to test handover
-    if total_minutes <= 120:
-        overlap = min(2, max(1, total_minutes // 20))
-        max_window = (total_minutes // 2) + overlap
+    # Adaptive window size: if 0.5h..1.5h test, split into 2 shifts so handover is tested
+    if 20 <= total_minutes <= 90:
+        win_cap = max(10, total_minutes // 2)
+        overlap = 1
     else:
-        max_window = MAX_WINDOW_MINUTES
+        win_cap = MAX_WINDOW_MINUTES
         overlap = OVERLAP_MINUTES
 
-    # Build windows
     windows = []
     cursor = 0
     idx = 0
     while cursor < total_minutes:
         start_min = max(0, cursor - (overlap if idx > 0 else 0))
-        end_min = min(total_minutes, start_min + max_window)
+        end_min = min(total_minutes, cursor + win_cap)
         if end_min <= start_min:
             break
         windows.append({
@@ -66,29 +63,26 @@ def main() -> int:
         })
         cursor = end_min
         idx += 1
-        if idx > 24:  # safety
+        if idx > 24:
             break
 
-    # Current window
     if shift_index >= len(windows):
-        print(f"::error::shift_index {shift_index} out of range (only {len(windows)} windows)")
-        # Still write minimal outputs so workflow can finish gracefully
-        print(f"window_index={shift_index}")
-        print(f"window_count={len(windows)}")
-        print(f"has_next=false")
         _write_github_output({
             "session_id": session_id,
+            "session_start": session_start.isoformat().replace("+00:00", "Z"),
             "window_index": str(shift_index),
             "window_count": str(len(windows)),
             "has_next": "false",
+            "next_shift_index": "",
             "window_deadline": "",
             "window_duration_min": "0",
         })
         return 0
 
     win = windows[shift_index]
-    window_start = session_start + timedelta(minutes=win["start_offset_min"])
-    window_end = session_start + timedelta(minutes=win["end_offset_min"])
+    # Use actual current time + duration_min for deadline so queued shifts still record full duration
+    window_start = now_utc()
+    window_end = window_start + timedelta(minutes=win["duration_min"])
     deadline = window_end.isoformat().replace("+00:00", "Z")
 
     has_next = "true" if (shift_index + 1) < len(windows) else "false"
@@ -107,10 +101,6 @@ def main() -> int:
 
     print("=== SHIFT PLAN ===")
     print(json.dumps(outputs, indent=2))
-    print(f"Total windows planned: {len(windows)}")
-    for w in windows:
-        print(f"  [{w['index']}] {w['start_offset_min']:4d} -> {w['end_offset_min']:4d} min  ({w['duration_min']} min)")
-
     _write_github_output(outputs)
     return 0
 
@@ -121,11 +111,7 @@ def _write_github_output(data: dict) -> None:
         return
     with open(out_file, "a", encoding="utf-8") as f:
         for k, v in data.items():
-            # multiline safe
-            if "\n" in str(v):
-                f.write(f"{k}<<EOF\n{v}\nEOF\n")
-            else:
-                f.write(f"{k}={v}\n")
+            f.write(f"{k}={v}\n")
 
 
 if __name__ == "__main__":
