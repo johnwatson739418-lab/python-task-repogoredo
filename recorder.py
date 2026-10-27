@@ -1,556 +1,1240 @@
-#!/usr/bin/env python3
 """
-God-level YouTube Live Recorder – Core Capture Engine (v3 Hardened)
-Fixes the 0-byte /live channel redirect bug on GitHub Actions (Azure IPs):
-- Layer 1: Default yt-dlp client (None) + --ignore-no-formats-error + ejs:github Node runtime
-- Layer 2: Fast curl HTML live-badge & canonical watch?v= extractor for /@Handle/live
-- Layer 3: Multi-client fallback (default, tv_embedded, web_safari, mweb, android_vr, ios, android)
-- Non-blocking stdout reader thread + explicit stderr error logging (never fails silently)
-- Continuous live monitoring until window deadline
+YouTube Live Recorder -- Cloud Runner Engine (Final Hardened 2-File Edition)
+Based on proven sucessgithub.txt with:
+- Free disk space monitoring (stops cleanly before runner 14GB disk fills up)
+- Safe FFmpeg concat check (skips concat & preserves raw chunks if free disk < chunk sum)
+- Default + Android + Web_Safari + HTML badge + RSS multi-detector
 """
 
-from __future__ import annotations
-
+import atexit
+import glob
 import json
 import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from queue import Empty, Queue
 
-import notify_telegram as tg
+socket.setdefaulttimeout(15)
 
-# ---------------------------------------------------------------------------
-# Config from environment
-# ---------------------------------------------------------------------------
-CHANNEL_HANDLE = os.getenv("CHANNEL_HANDLE", "").strip() or "@BagadBillagang-p6s"
-TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "").strip()
-OUT_DIR = Path(os.getenv("OUT_DIR", "streams"))
-COOKIE_FILE = os.getenv("COOKIE_FILE", "").strip()
-USE_COOKIES_ENV = os.getenv("USE_COOKIES", "false").lower() == "true"
-SESSION_DEADLINE = os.getenv("SESSION_DEADLINE", "").strip()  # ISO UTC
-MAX_RUNTIME_SEC = int(os.getenv("MAX_RUNTIME_SEC", "17400"))  # ~4h50m safety
-STALL_TIMEOUT_SEC = int(os.getenv("STALL_TIMEOUT_SEC", "90"))
-FRAGMENT_RETRIES = int(os.getenv("FRAGMENT_RETRIES", "30"))
-PROBE_INTERVAL_SEC = int(os.getenv("PROBE_INTERVAL_SEC", "25"))
-MIN_FREE_DISK_BYTES = 512 * 1024 * 1024  # 512 MB safety floor
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
-# Client priority: None = yt-dlp default (with ejs:github + node), followed by resilient fallbacks
-DOWNLOAD_CLIENTS: list[Optional[str]] = [
-    None,
-    "tv_embedded",
-    "web_safari",
-    "mweb",
-    "android_vr",
-    "ios",
-    "android",
-]
+CHANNEL_HANDLE = os.getenv("CHANNEL_HANDLE", "@Apka-aashu").strip()
+TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "UCGFi8l9sf5ab4hVJf7byBZg").strip()
+START_AT_IST = os.getenv("START_AT_IST", "").strip()
+HOURS = min(4.5, max(0.05, float(os.getenv("HOURS", "4.0"))))
+OUT_DIR = os.getenv("OUT_DIR", "./streams").strip()
 
-VALIDATION_CLIENTS: list[Optional[str]] = [
-    None,
-    "web_safari",
-    "tv_embedded",
-    "mweb",
-    "android_vr",
-    "android",
-]
+COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.txt").strip()
+if COOKIE_FILE and os.path.isfile(COOKIE_FILE):
+    try:
+        raw_cookie = open(COOKIE_FILE, "r", encoding="utf-8-sig", errors="replace").read().lstrip("\ufeff")
+        open(COOKIE_FILE, "w", encoding="utf-8", newline="\n").write(raw_cookie)
+    except Exception:
+        pass
 
-# Support separate video+audio streams (bv+ba) as well as pre-merged (b)
-FORMAT_SELECTOR = (
-    "bv*[height<=1080]+ba/"
-    "b[height<=1080]/"
-    "bv*[height<=720]+ba/"
-    "b[height<=720]/"
-    "bv*+ba/"
-    "b/best"
+USE_COOKIES = (
+    os.getenv("USE_COOKIES", "false").lower() == "true"
+    and bool(COOKIE_FILE)
+    and os.path.isfile(COOKIE_FILE)
+    and os.path.getsize(COOKIE_FILE) > 20
 )
 
-# ---------------------------------------------------------------------------
-# Globals
-# ---------------------------------------------------------------------------
-LIVE_DETECTED_EVER = False
-START_TS = time.time()
+FORMAT_SELECTOR = (
+    "b[height=720][protocol*=m3u8]"
+    "/b[protocol*=m3u8]"
+    "/b[height=720]"
+    "/b"
+)
+SORT_EXPR = "res,fps,br"
+
+PRIMARY_RECHECK_SECONDS = 20
+ACTIVE_SESSION_RECHECK_SECONDS = 120
+SECONDARY_WAITING_RECHECK_SECONDS = 90
+SECONDARY_ACTIVE_RECHECK_SECONDS = 120
+
+PROBE_TIMEOUT_SECONDS = 15
+HTML_TIMEOUT_SECONDS = 8
+
+HEARTBEAT_SECONDS = 15
+POLL_INTERVAL_SECONDS = 2
+STALL_SECONDS = 240
+OFFLINE_GRACE_SECONDS = 180
+FAILURE_COOLDOWN_SECONDS = 15
+
+MIN_SAVE_BYTES = 1_000_000
+MIN_FREE_DISK_BYTES = 512 * 1024 * 1024  # 512 MB safety floor on runner
+COPY_BUFFER_BYTES = 8 * 1024 * 1024
+
+SHORT_EXIT_PROTECTION_SECONDS = 90
+SHORT_EXIT_RETRIES = 2
+SHORT_EXIT_BACKOFF_SECONDS = 4
+STALL_RETRY_BACKOFF_SECONDS = 4
+CLIENT_SWITCH_DELAY_SECONDS = 5
+
+DOWNLOAD_CLIENTS = ["android", None]
+VALIDATION_CLIENTS = ["android", "web_safari", None]
+
+SESSION_ACTIVE = threading.Event()
+DOWNLOAD_ACTIVE = threading.Event()
+
 STOP_REQUESTED = False
-FALLBACK_NOTIFIED = False
+DISK_LIMIT_REACHED = False
+CURRENT_PROC = None
+CURRENT_PROC_LOCK = threading.Lock()
+LOG_LOCK = threading.Lock()
 
 
-def log(msg: str) -> None:
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    try:
-        print(f"[{ts}] {msg}", flush=True)
-    except UnicodeEncodeError:
-        print(f"[{ts}] {msg.encode('ascii', errors='replace').decode('ascii')}", flush=True)
+def slug_handle(handle):
+    value = str(handle).strip().rstrip("/").split("/")[-1]
+    value = value.replace("@", "")
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", value) or "channel"
 
 
-def client_label(client: Optional[str]) -> str:
-    return client if client else "default"
+def build_channel_url(channel_input):
+    value = str(channel_input).strip().rstrip("/")
+    if value.startswith(("http://", "https://")):
+        return value
+    if value.startswith("@"):
+        return f"https://www.youtube.com/{value}"
+    if value.startswith("UC"):
+        return f"https://www.youtube.com/channel/{value}"
+    return f"https://www.youtube.com/@{value}"
 
 
-def js_runtime_args() -> list[str]:
-    args = ["--remote-components", "ejs:github"]
-    if shutil.which("node"):
-        args += ["--js-runtimes", "node"]
-    elif shutil.which("nodejs"):
-        args += ["--js-runtimes", "nodejs"]
-    return args
+CHANNEL_SLUG = slug_handle(CHANNEL_HANDLE)
+CHANNEL_URL = build_channel_url(CHANNEL_HANDLE)
+LIVE_URL = f"{CHANNEL_URL}/live"
+STREAMS_URL = f"{CHANNEL_URL}/streams"
+SHORTS_URL = f"{CHANNEL_URL}/shorts"
+
+CHUNKS_DIR = os.path.join(OUT_DIR, "_chunks")
+LOG_PATH = os.path.join(OUT_DIR, f"{CHANNEL_SLUG}_session.log")
+SUMMARY_PATH = os.path.join(OUT_DIR, f"{CHANNEL_SLUG}_summary.json")
+STATE_PATH = os.path.join(OUT_DIR, f"{CHANNEL_SLUG}_active_state.json")
+
+os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(CHUNKS_DIR, exist_ok=True)
 
 
-JS_ARGS = js_runtime_args()
-
-
-def now_deadline_passed() -> bool:
-    if not SESSION_DEADLINE:
-        return (time.time() - START_TS) > MAX_RUNTIME_SEC
-    try:
-        dl = datetime.fromisoformat(SESSION_DEADLINE.replace("Z", "+00:00"))
-        return datetime.now(timezone.utc) >= dl
-    except Exception:
-        return (time.time() - START_TS) > MAX_RUNTIME_SEC
-
-
-def remaining_seconds() -> int:
-    if SESSION_DEADLINE:
+def log(message):
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+    with LOG_LOCK:
+        print(line, flush=True)
         try:
-            dl = datetime.fromisoformat(SESSION_DEADLINE.replace("Z", "+00:00"))
-            return max(0, int((dl - datetime.now(timezone.utc)).total_seconds()))
+            with open(LOG_PATH, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
         except Exception:
             pass
-    return max(0, MAX_RUNTIME_SEC - int(time.time() - START_TS))
 
 
-def cookies_available() -> bool:
+def log_raw(prefix, message):
+    value = str(message).rstrip()
+    if value:
+        log(f"{prefix} | {value}")
+
+
+def hms(seconds):
+    seconds = max(0, int(seconds))
+    return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+
+
+def client_label(client):
+    return client or "default"
+
+
+def normalize_token(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def normalize_message(value):
+    value = unicodedata.normalize("NFKD", str(value or ""))
     return (
-        USE_COOKIES_ENV
-        and bool(COOKIE_FILE)
-        and Path(COOKIE_FILE).is_file()
-        and Path(COOKIE_FILE).stat().st_size > 50
+        value.replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .casefold()
     )
 
 
-def build_channel_live_url(handle: str) -> str:
-    clean = handle.strip()
-    if clean.startswith(("http://", "https://")):
-        return clean.rstrip("/") + "/live" if not clean.endswith("/live") else clean
-    if clean.startswith("UC") and len(clean) >= 20:
-        return f"https://www.youtube.com/channel/{clean}/live"
-    if not clean.startswith("@"):
-        clean = f"@{clean}"
-    return f"https://www.youtube.com/{clean}/live"
+BOTCHECK_MARKERS = ["sign in to confirm you're not a bot", "confirm you're not a bot"]
+NO_FORMAT_MARKERS = ["no video formats found", "requested format is not available"]
+RATE_LIMIT_MARKERS = ["http error 403", "http error 429", "try again later", "too many requests"]
+NOT_LIVE_MARKERS = ["the channel is not currently live", "this live event will begin", "this live event has ended"]
+NORMAL_END_MARKERS = ["finished downloading", "download complete", "has already been downloaded"]
 
 
-def fetch_html_live_video_id(url: str, with_cookies: bool) -> Optional[str]:
-    """Fast curl check of /@Handle/live HTML to extract active live videoId."""
-    curl_bin = shutil.which("curl")
-    if not curl_bin:
-        return None
-    cmd = [
-        curl_bin, "-s", "-L", "--compressed", "--max-time", "15",
-        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "-H", "Accept-Language: en-US,en;q=0.9",
-    ]
-    if with_cookies and cookies_available():
-        cmd += ["-b", COOKIE_FILE]
-    cmd.append(url)
+SUMMARY = {
+    "channel": CHANNEL_HANDLE,
+    "channel_url": CHANNEL_URL,
+    "target_channel_id": TARGET_CHANNEL_ID or None,
+    "video_id": None,
+    "detect_source": None,
+    "client_used": None,
+    "final_file": None,
+    "final_size_mb": 0.0,
+    "chunk_count": 0,
+    "status": "init",
+    "failure_reason": None,
+}
+
+
+def write_summary(**updates):
+    SUMMARY.update(updates)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=18)
-        html = r.stdout or ""
-        if not html:
-            return None
-        # Check if canonical points to a watch?v= URL and page has isLiveNow / isLive
-        if any(m in html for m in ('"isLive":true', '"isLiveNow":true', 'BADGE_STYLE_TYPE_LIVE_NOW')):
-            canon = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/watch\?v=([A-Za-z0-9_-]{11})"', html)
-            if canon:
-                return canon.group(1)
-            vid_match = re.search(r'"videoDetails"\s*:\s*\{[^}]*"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"', html)
-            if vid_match:
-                return vid_match.group(1)
-            # Scored fallback around live badge
-            for m in re.finditer(r'"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"', html):
-                vid = m.group(1)
-                ctx = html[max(0, m.start() - 1200):min(len(html), m.end() + 1200)]
-                if '"isLive":true' in ctx or '"isLiveNow":true' in ctx or 'BADGE_STYLE_TYPE_LIVE_NOW' in ctx:
-                    return vid
-    except Exception as e:
-        log(f"html probe exception: {e}")
-    return None
-
-
-def build_yt_dlp_base(client: Optional[str], with_cookies: bool) -> list[str]:
-    cmd = [
-        sys.executable, "-m", "yt_dlp",
-        "--no-config",
-        "--no-warnings",
-        "--newline",
-        "--restrict-filenames",
-        "--no-part",
-        "--no-playlist",
-        "--no-live-from-start",
-        "--fragment-retries", str(FRAGMENT_RETRIES),
-        "--retries", "20",
-        "--extractor-retries", "15",
-        "--retry-sleep", "http:2",
-        "--retry-sleep", "fragment:1",
-        "--skip-unavailable-fragments",
-        "--merge-output-format", "mp4",
-        "-f", FORMAT_SELECTOR,
-    ] + JS_ARGS
-    if client:
-        cmd += ["--extractor-args", f"youtube:player_client={client}"]
-    if with_cookies and cookies_available():
-        cmd += ["--cookies", COOKIE_FILE]
-    return cmd
-
-
-def probe_live(handle: str) -> Optional[dict]:
-    """Return {id, title, client, used_cookies, url} if channel is currently live."""
-    live_url = build_channel_live_url(handle)
-    cookie_modes = [True, False] if cookies_available() else [False]
-
-    for use_c in cookie_modes:
-        # Fast Layer 1: HTML canonical / badge check to resolve /live redirect into direct watch?v= ID
-        html_vid = fetch_html_live_video_id(live_url, use_c)
-        target_urls = []
-        if html_vid:
-            log(f"HTML live badge found video_id={html_vid} for {handle}")
-            target_urls.append(f"https://www.youtube.com/watch?v={html_vid}")
-        target_urls.append(live_url)
-
-        for target_url in target_urls:
-            for client in VALIDATION_CLIENTS:
-                if now_deadline_passed() or STOP_REQUESTED:
-                    return None
-                cmd = [
-                    sys.executable, "-m", "yt_dlp",
-                    "--no-config",
-                    "--no-warnings",
-                    "--ignore-no-formats-error",
-                    "--dump-json",
-                    "--skip-download",
-                    "--playlist-items", "1",
-                ] + JS_ARGS
-                if client:
-                    cmd += ["--extractor-args", f"youtube:player_client={client}"]
-                if use_c and cookies_available():
-                    cmd += ["--cookies", COOKIE_FILE]
-                cmd.append(target_url)
-
-                try:
-                    r = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=35,
-                    )
-                    if r.returncode != 0 or not r.stdout.strip():
-                        err_snip = " ".join((r.stderr or "").split())[:200]
-                        if err_snip and "is not currently live" not in err_snip.lower():
-                            log(f"probe warn | client={client_label(client)} | cookies={use_c} | {err_snip}")
-                        continue
-
-                    lines = [ln for ln in r.stdout.splitlines() if ln.strip().startswith("{")]
-                    if not lines:
-                        continue
-                    data = json.loads(lines[-1])
-                    if data.get("_type") == "playlist" and data.get("entries"):
-                        entries = [e for e in data["entries"] if e]
-                        if not entries:
-                            continue
-                        data = entries[0]
-
-                    vid = data.get("id")
-                    if not vid or len(str(vid)) != 11:
-                        continue
-                    live_status = str(data.get("live_status") or "").lower()
-                    is_live = bool(data.get("is_live")) or live_status == "is_live"
-                    if not is_live:
-                        continue
-                    return {
-                        "id": vid,
-                        "title": (data.get("title") or "live")[:100],
-                        "client": client,
-                        "used_cookies": use_c,
-                        "url": f"https://www.youtube.com/watch?v={vid}",
-                    }
-                except subprocess.TimeoutExpired:
-                    log(f"probe timeout | client={client_label(client)} | cookies={use_c}")
-                except Exception as e:
-                    log(f"probe error ({client_label(client)}, cookies={use_c}): {e}")
-
-        # If HTML found a confirmed live video_id even if dump-json had a transient error, lock onto it!
-        if html_vid:
-            log(f"Using HTML-resolved live video_id={html_vid} directly")
-            return {
-                "id": html_vid,
-                "title": "live_stream",
-                "client": None,
-                "used_cookies": use_c,
-                "url": f"https://www.youtube.com/watch?v={html_vid}",
-            }
-
-    return None
-
-
-def _stream_reader(proc: subprocess.Popen, state: dict) -> None:
-    """Background daemon thread to read stdout without blocking main loop."""
-    try:
-        assert proc.stdout is not None
-        for raw_line in iter(proc.stdout.readline, ""):
-            if not raw_line:
-                break
-            line = raw_line.strip()
-            if not line:
-                continue
-            state["last_output_ts"] = time.time()
-            if any(k in line for k in ("ERROR", "WARNING", "chosen=", "Destination", "frame=", "[download]")):
-                log(f"yt-dlp: {line[:220]}")
+        with open(SUMMARY_PATH, "w", encoding="utf-8") as fh:
+            json.dump(SUMMARY, fh, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
 
-def current_file_size(base_path: Path) -> int:
-    """Check size of base_path or any .part / format variant."""
-    total = 0
-    parent = base_path.parent
-    stem = base_path.stem
-    if parent.exists():
-        for candidate in parent.glob(f"{stem}*"):
-            try:
-                total = max(total, candidate.stat().st_size)
-            except OSError:
-                pass
-    return total
+def command_exists(name):
+    return shutil.which(name) is not None
 
 
-def finalize_part_file(base_path: Path) -> Path:
-    parent = base_path.parent
-    stem = base_path.stem
-    if parent.exists():
-        for candidate in parent.glob(f"{stem}*"):
-            if candidate.is_file() and not candidate.name.endswith(".part"):
-                return candidate
-    part_path = Path(str(base_path) + ".part")
-    if part_path.exists():
+def install_dependencies():
+    log(f"installing dependencies for {CHANNEL_HANDLE} (cookies={USE_COOKIES})")
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp[default,curl-cffi]"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        log_raw("yt_dlp_install_error", exc)
+
+    required = []
+    if not command_exists("curl"):
+        required.append("curl")
+    if not command_exists("ffmpeg"):
+        required.append("ffmpeg")
+    if not command_exists("node") and not command_exists("nodejs"):
+        required.append("nodejs")
+
+    if required:
+        log(f"installing_os_packages | {','.join(required)}")
+        sudo_prefix = ["sudo"] if command_exists("sudo") else []
         try:
-            part_path.replace(base_path)
-            return base_path
-        except OSError:
-            return part_path
-    return base_path
+            subprocess.run(sudo_prefix + ["apt-get", "update", "-qq"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(sudo_prefix + ["apt-get", "install", "-y", "-qq"] + required, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            log_raw("os_dependency_error", exc)
+
+    version = ""
+    try:
+        result = subprocess.run([sys.executable, "-m", "yt_dlp", "--version"], text=True, capture_output=True, timeout=15)
+        version = result.stdout.strip()
+    except Exception:
+        pass
+    log(f"yt_dlp_version | {version or 'unknown'}")
 
 
-def stop_proc_gracefully(proc: Optional[subprocess.Popen], timeout: float = 20.0) -> None:
-    if not proc or proc.poll() is not None:
+def js_runtime_args():
+    args = ["--remote-components", "ejs:github"]
+    if command_exists("node"):
+        args += ["--js-runtimes", "node"]
+    elif command_exists("nodejs"):
+        args += ["--js-runtimes", "nodejs"]
+    return args
+
+
+JS_ARGS = []
+
+
+def fetch_text(url):
+    curl_bin = shutil.which("curl")
+    if not curl_bin:
+        return ""
+
+    cmd = [
+        curl_bin, "-s", "-L", "--compressed", "--max-time", str(HTML_TIMEOUT_SECONDS),
+        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "-H", "Accept-Language: en-US,en;q=0.9",
+    ]
+    if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE):
+        cmd += ["-b", COOKIE_FILE]
+    cmd.append(url)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=HTML_TIMEOUT_SECONDS + 2)
+        if result.returncode == 0 and result.stdout:
+            return result.stdout
+    except Exception:
+        pass
+    return ""
+
+
+TARGET = {
+    "channel_id": TARGET_CHANNEL_ID.strip() or None,
+    "exact_aliases": set(),
+    "norm_aliases": set(),
+}
+
+
+def add_target_alias(value):
+    value = str(value or "").strip()
+    if not value:
+        return
+    lower = value.lower()
+    TARGET["exact_aliases"].add(lower)
+    if lower.startswith("@"):
+        TARGET["exact_aliases"].add(lower[1:])
+    normalized = normalize_token(lower)
+    if len(normalized) >= 4:
+        TARGET["norm_aliases"].add(normalized)
+
+
+def resolve_target_identity():
+    add_target_alias(CHANNEL_HANDLE)
+    add_target_alias(CHANNEL_SLUG)
+    add_target_alias(CHANNEL_URL)
+
+    html = fetch_text(CHANNEL_URL)
+    if not html:
+        log(f"target_identity | channel_id={TARGET['channel_id'] or 'configured-only'}")
+        return
+
+    if not TARGET["channel_id"]:
+        for pattern in (
+            r'"externalId"\s*:\s*"(UC[A-Za-z0-9_-]{22})"',
+            r'"channelId"\s*:\s*"(UC[A-Za-z0-9_-]{22})"',
+            r'"browseId"\s*:\s*"(UC[A-Za-z0-9_-]{22})"',
+            r'<meta\s+itemprop="channelId"\s+content="(UC[A-Za-z0-9_-]{22})"',
+        ):
+            match = re.search(pattern, html)
+            if match:
+                TARGET["channel_id"] = match.group(1)
+                break
+
+    for pattern in (
+        r'"canonicalBaseUrl"\s*:\s*"(/@[^\"]+)"',
+        r'"vanityChannelUrl"\s*:\s*"(https://www\.youtube\.com/[^\"]+)"',
+        r'<link rel="canonical" href="https://www\.youtube\.com/([^\"]+)"',
+    ):
+        for match in re.finditer(pattern, html):
+            add_target_alias(match.group(1))
+
+    write_summary(target_channel_id=TARGET["channel_id"])
+    log(f"target_identity | channel_id={TARGET['channel_id'] or 'unknown'}")
+
+
+def target_match(info):
+    if not info:
+        return False, "empty_info"
+    direct_id = str(info.get("channel_id") or "").strip()
+    if TARGET.get("channel_id"):
+        if direct_id:
+            if direct_id == TARGET["channel_id"]:
+                return True, "channel_id"
+            return False, "wrong_channel_id"
+
+    fields = [
+        info.get("channel"), info.get("uploader"), info.get("channel_url"),
+        info.get("uploader_url"), info.get("channel_id"), info.get("uploader_id"),
+    ]
+    blob = " ".join(str(value) for value in fields if value)
+    lower_blob = blob.lower()
+
+    for alias in TARGET["exact_aliases"]:
+        if alias and alias in lower_blob:
+            return True, "alias"
+
+    normalized = normalize_token(blob)
+    for alias in TARGET["norm_aliases"]:
+        if alias and alias in normalized:
+            return True, "alias_normalized"
+
+    return False, blob or "owner_unknown"
+
+
+def is_live_candidate(info):
+    if not info or not info.get("id"):
+        return False
+    live_status = str(info.get("live_status") or "").casefold()
+    return bool(info.get("is_live") or live_status == "is_live")
+
+
+def run_ytdlp_json(url, client):
+    command = [
+        sys.executable, "-m", "yt_dlp", "--no-config", "-J",
+        "--skip-download", "--no-warnings", "--ignore-no-formats-error",
+        "--playlist-items", "1",
+    ] + JS_ARGS
+
+    if client:
+        command += ["--extractor-args", f"youtube:player_client={client}"]
+    if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE):
+        command += ["--cookies", COOKIE_FILE]
+    command.append(url)
+
+    try:
+        result = subprocess.run(command, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=PROBE_TIMEOUT_SECONDS)
+        if result.returncode == 0 and result.stdout.strip():
+            raw = json.loads(result.stdout)
+            if raw.get("_type") == "playlist" and raw.get("entries"):
+                for item in raw["entries"]:
+                    if item and is_live_candidate(item):
+                        return item
+                return raw["entries"][0]
+            return raw
+    except Exception:
+        pass
+    return None
+
+
+def extract_live_badge_ids(html):
+    if not html:
+        return []
+    scores = {}
+    patterns = [r'"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"', r'watch\?v=([A-Za-z0-9_-]{11})', r'shorts/([A-Za-z0-9_-]{11})']
+    for pattern in patterns:
+        for match in re.finditer(pattern, html, flags=re.IGNORECASE):
+            video_id = match.group(1)
+            context = html[max(0, match.start() - 1500):min(len(html), match.end() + 1500)].lower()
+            score = scores.get(video_id, 0)
+            if any(k in context for k in ("islivenow", "is_live_now", "badge_style_type_live_now", '"style":"live"')):
+                score += 10
+            if re.search(r'"label"\s*:\s*"live"', context) or re.search(r'"text"\s*:\s*"live"', context):
+                score += 5
+            if "watching" in context:
+                score += 2
+            scores[video_id] = score
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    return [video_id for video_id, score in ranked if score >= 5]
+
+
+def extract_rss_video_ids(xml):
+    if not xml:
+        return []
+    return re.findall(r"<yt:videoId>([A-Za-z0-9_-]{11})</yt:videoId>", xml)[:3]
+
+
+def validate_candidate(video_id, client):
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    info = run_ytdlp_json(watch_url, client)
+    if not info or not is_live_candidate(info):
+        return None
+    matched, reason = target_match(info)
+    if not matched:
+        return None
+    return {"id": video_id, "url": watch_url, "client": client, "match_reason": reason}
+
+
+def verify_live_id(video_id, source_kind):
+    video_id = str(video_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        return None
+
+    started = time.monotonic()
+    executor = ThreadPoolExecutor(max_workers=len(VALIDATION_CLIENTS))
+    futures = {executor.submit(validate_candidate, video_id, client): client for client in VALIDATION_CLIENTS}
+    result = None
+
+    try:
+        for future in as_completed(futures, timeout=PROBE_TIMEOUT_SECONDS + 2):
+            try:
+                candidate = future.result()
+            except Exception:
+                candidate = None
+            if candidate:
+                result = candidate
+                break
+    except Exception:
+        pass
+    finally:
+        executor.shutdown(wait=False)
+
+    if result:
+        elapsed = time.monotonic() - started
+        log(f"detect_live | source={source_kind} | live id={result['id']} | client={client_label(result['client'])} | match={result['match_reason']} | validation={elapsed:.1f}s")
+        return {"id": result["id"], "url": result["url"], "source": source_kind}
+    return None
+
+
+def probe_fast():
+    executor = ThreadPoolExecutor(max_workers=4)
+    futures = {
+        executor.submit(fetch_text, CHANNEL_URL): "home",
+        executor.submit(run_ytdlp_json, LIVE_URL, None): "default_live",
+        executor.submit(run_ytdlp_json, LIVE_URL, "android"): "android_live",
+        executor.submit(run_ytdlp_json, LIVE_URL, "web_safari"): "web_live",
+    }
+    home_html = ""
+    live_infos = {}
+
+    try:
+        for future in as_completed(futures, timeout=PROBE_TIMEOUT_SECONDS + 4):
+            kind = futures[future]
+            try:
+                value = future.result()
+            except Exception:
+                value = None
+            if kind == "home":
+                home_html = value or ""
+            else:
+                live_infos[kind] = value
+    except Exception:
+        pass
+    finally:
+        executor.shutdown(wait=False)
+
+    for key, client in (("default_live", None), ("android_live", "android"), ("web_live", "web_safari")):
+        info = live_infos.get(key)
+        if not info or not is_live_candidate(info):
+            continue
+        matched, reason = target_match(info)
+        if not matched:
+            continue
+        video_id = info["id"]
+        log(f"detect_live | source=live_endpoint | live id={video_id} | client={client_label(client)} | match={reason}")
+        return {"id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}", "source": "live_endpoint"}
+
+    for video_id in extract_live_badge_ids(home_html)[:2]:
+        result = verify_live_id(video_id, "home_live_badge")
+        if result:
+            return result
+    return None
+
+
+def probe_secondary():
+    channel_id = TARGET.get("channel_id")
+    if not channel_id:
+        return None
+
+    rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+    executor = ThreadPoolExecutor(max_workers=3)
+    futures = {
+        executor.submit(fetch_text, rss_url): "rss",
+        executor.submit(fetch_text, STREAMS_URL): "streams",
+        executor.submit(fetch_text, SHORTS_URL): "shorts",
+    }
+    values = {"rss": "", "streams": "", "shorts": ""}
+
+    try:
+        for future in as_completed(futures, timeout=HTML_TIMEOUT_SECONDS + 4):
+            kind = futures[future]
+            try:
+                value = future.result()
+            except Exception:
+                value = None
+            values[kind] = value or ""
+    except Exception:
+        pass
+    finally:
+        executor.shutdown(wait=False)
+
+    for video_id in extract_rss_video_ids(values["rss"]):
+        result = verify_live_id(video_id, "rss_feed")
+        if result:
+            return result
+
+    for page_name in ("streams", "shorts"):
+        for video_id in extract_live_badge_ids(values[page_name])[:2]:
+            result = verify_live_id(video_id, f"{page_name}_badge")
+            if result:
+                return result
+    return None
+
+
+def stop_proc(process):
+    if not process:
         return
     try:
-        if sys.platform == "win32":
-            proc.terminate()
-        else:
-            proc.send_signal(signal.SIGINT)
-        proc.wait(timeout=timeout)
+        if process.poll() is not None:
+            return
+        process.terminate()
+        process.wait(timeout=10)
+        return
     except Exception:
         try:
-            proc.kill()
+            process.kill()
+            process.wait(timeout=5)
         except Exception:
             pass
 
 
-def record_stream(video_id: str, session_idx: int, preferred_client: Optional[str]) -> list[Path]:
-    """Record stream in resilient chunks until stream ends or deadline passes."""
-    global STOP_REQUESTED, FALLBACK_NOTIFIED
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+def sigterm_handler(signum, frame):
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+    log("termination_requested | stopping download; saved files will be recovered")
+    with CURRENT_PROC_LOCK:
+        process = CURRENT_PROC
+    stop_proc(process)
 
-    clients: list[Optional[str]] = [preferred_client] + [c for c in DOWNLOAD_CLIENTS if c != preferred_client]
-    cookie_modes = [True, False] if cookies_available() else [False]
-    recorded_chunks: list[Path] = []
-    chunk_idx = 1
 
-    for use_c in cookie_modes:
-        if not use_c and cookies_available() and not FALLBACK_NOTIFIED:
-            FALLBACK_NOTIFIED = True
-            tg.fallback_mode(CHANNEL_HANDLE, "Cookie capture failed; switched to cookie-less client mode")
+signal.signal(signal.SIGTERM, sigterm_handler)
+signal.signal(signal.SIGINT, sigterm_handler)
+atexit.register(lambda: stop_proc(CURRENT_PROC))
 
-        for client in clients:
-            if now_deadline_passed() or STOP_REQUESTED:
-                return recorded_chunks
+
+def build_final_path(live_id, session_index):
+    suffix = "" if session_index == 1 else f"_r{session_index}"
+    return os.path.join(OUT_DIR, f"{CHANNEL_SLUG}_{live_id}{suffix}.ts")
+
+
+def build_chunk_dir(live_id, session_index):
+    return os.path.join(CHUNKS_DIR, f"{CHANNEL_SLUG}_{live_id}_r{session_index}")
+
+
+def build_chunk_path(active, index=None):
+    index = index or active["chunk_index"]
+    os.makedirs(active["chunk_dir"], exist_ok=True)
+    return os.path.join(active["chunk_dir"], f"{CHANNEL_SLUG}_{active['live_id']}_r{active['session_index']}_chunk{index:04d}.ts")
+
+
+def atomic_json_write(path, payload):
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
+
+
+def save_active_state(active):
+    if active is None:
+        try:
+            os.remove(STATE_PATH)
+        except Exception:
+            pass
+        return
+    try:
+        atomic_json_write(STATE_PATH, active)
+    except Exception as exc:
+        log_raw("state_write_error", exc)
+
+
+def chunk_number(path):
+    match = re.search(r"_chunk(\d+)\.ts(?:\.part)?$", os.path.basename(path))
+    return int(match.group(1)) if match else 0
+
+
+def is_archived_short_exit(path):
+    return "_short_exit_" in os.path.basename(path)
+
+
+def register_recovered_chunks(active):
+    os.makedirs(active["chunk_dir"], exist_ok=True)
+    registered = [
+        path for path in active.get("chunks", [])
+        if os.path.isfile(path) and os.path.getsize(path) >= MIN_SAVE_BYTES and not is_archived_short_exit(path)
+    ]
+    known = set(registered)
+    recovered = []
+
+    candidates = glob.glob(os.path.join(active["chunk_dir"], "*.ts")) + glob.glob(os.path.join(active["chunk_dir"], "*.ts.part"))
+    for path in sorted(candidates, key=chunk_number):
+        if is_archived_short_exit(path):
+            continue
+        final_path = path[:-5] if path.endswith(".part") else path
+        if path.endswith(".part") and not os.path.exists(final_path) and os.path.getsize(path) >= MIN_SAVE_BYTES:
+            try:
+                os.replace(path, final_path)
+                path = final_path
+            except Exception:
+                pass
+        if path.endswith(".part") or not os.path.isfile(path) or os.path.getsize(path) < MIN_SAVE_BYTES:
+            continue
+        if path not in known:
+            registered.append(path)
+            known.add(path)
+            recovered.append(path)
+
+    registered.sort(key=chunk_number)
+    active["chunks"] = registered
+    highest = max([chunk_number(path) for path in registered] + [0])
+    active["chunk_index"] = max(int(active.get("chunk_index", 1)), highest + 1)
+    active["recording_path"] = None
+    if recovered:
+        log(f"recovered_chunks | count={len(recovered)} | total={len(registered)}")
+    return active
+
+
+def load_active_state():
+    if not os.path.exists(STATE_PATH):
+        return None
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as fh:
+            active = json.load(fh)
+        required = {"live_id", "session_index", "chunk_index", "final_ts", "chunk_dir", "chunks"}
+        if not required.issubset(active):
+            raise ValueError("missing required state fields")
+        active.setdefault("preferred_client", "android")
+        active.setdefault("client_locked", False)
+        active.setdefault("short_exit_streak", 0)
+        active.setdefault("short_exit_seq", 0)
+        active.setdefault("recording_path", None)
+        active.setdefault("last_failure_reason", None)
+        active.setdefault("recovery_needed", True)
+        active["offline_since"] = None
+        active["cooldown_until"] = 0
+        register_recovered_chunks(active)
+        save_active_state(active)
+        SESSION_ACTIVE.set()
+        log(f"resume_state_loaded | live id={active['live_id']} | chunks={len(active['chunks'])}")
+        return active
+    except Exception as exc:
+        log_raw("state_load_error", f"ignoring corrupt state | {exc}")
+        return None
+
+
+def new_session(live):
+    live_id = live["id"]
+    session_index = 1
+    while os.path.exists(build_final_path(live_id, session_index)) or os.path.isdir(build_chunk_dir(live_id, session_index)):
+        session_index += 1
+
+    active = {
+        "live_id": live_id,
+        "live_url": f"https://www.youtube.com/watch?v={live_id}",
+        "preferred_client": "android",
+        "client_locked": False,
+        "short_exit_streak": 0,
+        "short_exit_seq": 0,
+        "session_index": session_index,
+        "chunk_index": 1,
+        "final_ts": build_final_path(live_id, session_index),
+        "chunk_dir": build_chunk_dir(live_id, session_index),
+        "chunks": [],
+        "recording_path": None,
+        "offline_since": None,
+        "cooldown_until": 0,
+        "last_failure_reason": None,
+        "recovery_needed": False,
+    }
+    os.makedirs(active["chunk_dir"], exist_ok=True)
+    save_active_state(active)
+    SESSION_ACTIVE.set()
+    write_summary(video_id=live_id, detect_source=live.get("source"), status="session_open")
+    log(f"opened_session | live id={live_id} | source={live.get('source')} | output={os.path.basename(active['final_ts'])}")
+    return active
+
+
+def archive_short_exit(active, chunk_path):
+    if not chunk_path or not os.path.isfile(chunk_path):
+        return None
+    active["short_exit_seq"] = int(active.get("short_exit_seq", 0)) + 1
+    stem, ext = os.path.splitext(chunk_path)
+    archived = f"{stem}_short_exit_{active['short_exit_seq']:02d}{ext}"
+    try:
+        os.replace(chunk_path, archived)
+        return archived
+    except Exception:
+        return chunk_path
+
+
+def build_final_file(active):
+    register_recovered_chunks(active)
+    chunks = [
+        path for path in active["chunks"]
+        if os.path.isfile(path) and os.path.getsize(path) >= MIN_SAVE_BYTES and not is_archived_short_exit(path)
+    ]
+    chunks.sort(key=chunk_number)
+    if not chunks:
+        return None
+
+    final_path = active["final_ts"]
+    if len(chunks) == 1:
+        try:
+            os.replace(chunks[0], final_path)
+        except Exception:
+            try:
+                shutil.copyfile(chunks[0], final_path)
+            except Exception:
+                return None
+        return final_path if os.path.isfile(final_path) and os.path.getsize(final_path) >= MIN_SAVE_BYTES else None
+
+    # Check if there is enough free disk space to safely concat multiple chunks
+    total_chunk_bytes = sum(os.path.getsize(p) for p in chunks if os.path.isfile(p))
+    free_bytes = shutil.disk_usage(OUT_DIR).free
+    if free_bytes < total_chunk_bytes + 256 * 1024 * 1024:
+        log(f"concat_skipped_low_disk | free={free_bytes / 1048576:.0f}MB < required={(total_chunk_bytes / 1048576) + 256:.0f}MB | preserving {len(chunks)} chunks for direct upload")
+        return None
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        log("finalize_error | ffmpeg unavailable; preserving chunks")
+        return None
+
+    list_path = os.path.join(active["chunk_dir"], "concat_list.txt")
+    try:
+        with open(list_path, "w", encoding="utf-8") as fh:
+            for path in chunks:
+                escaped = os.path.abspath(path).replace("'", "'\\''")
+                fh.write(f"file '{escaped}'\n")
+
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-fflags", "+genpts", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", "-y", final_path],
+            text=True, capture_output=True, timeout=1800,
+        )
+        if result.returncode == 0 and os.path.isfile(final_path) and os.path.getsize(final_path) >= MIN_SAVE_BYTES:
+            for path in chunks:
+                try: os.remove(path)
+                except Exception: pass
+            try: os.remove(list_path)
+            except Exception: pass
+            return final_path
+        log_raw("ffmpeg_concat_failed", result.stderr)
+    except Exception as exc:
+        log_raw("ffmpeg_concat_error", exc)
+    return None
+
+
+def close_session(active, reason):
+    SESSION_ACTIVE.clear()
+    DOWNLOAD_ACTIVE.clear()
+    final_path = build_final_file(active)
+    if final_path and os.path.isfile(final_path):
+        size_mb = os.path.getsize(final_path) / 1048576
+        log(f"session_closed | {reason} | {size_mb:.1f} MB | {os.path.basename(final_path)} | chunks={len(active['chunks'])}")
+    else:
+        size_mb = sum(os.path.getsize(p) for p in active.get("chunks", []) if os.path.isfile(p)) / 1048576
+        log(f"session_closed | chunks_preserved | {reason} | live id={active['live_id']} | chunks={len(active['chunks'])} | {size_mb:.1f} MB")
+
+    write_summary(
+        video_id=active["live_id"], final_file=(os.path.basename(final_path) if final_path else None),
+        final_size_mb=round(size_mb, 1), chunk_count=len(active["chunks"]), status="session_closed", failure_reason=None,
+    )
+    save_active_state(None)
+
+
+def output_reader(stream, output_state):
+    for raw_line in iter(stream.readline, ""):
+        if not raw_line:
+            break
+        print(raw_line, end="", flush=True)
+        lowered = normalize_message(raw_line)
+        if "chosen=" in raw_line or "error:" in lowered or "warning:" in lowered:
+            log_raw("yt_dlp", raw_line)
+        output_state["botcheck"] |= any(marker in lowered for marker in BOTCHECK_MARKERS)
+        output_state["no_formats"] |= any(marker in lowered for marker in NO_FORMAT_MARKERS)
+        output_state["rate_limited"] |= any(marker in lowered for marker in RATE_LIMIT_MARKERS)
+        output_state["not_live"] |= any(marker in lowered for marker in NOT_LIVE_MARKERS)
+        output_state["normal_exit"] |= any(marker in lowered for marker in NORMAL_END_MARKERS)
+
+
+def classify_output(output_state):
+    for key in ("botcheck", "no_formats", "rate_limited", "not_live"):
+        if output_state[key]:
+            return key
+    return "normal_end" if output_state["normal_exit"] else "no_file"
+
+
+def make_download_cmd(active, chunk_path, client):
+    command = [
+        sys.executable, "-m", "yt_dlp", "--no-config", "--newline", "--no-warnings",
+        "--restrict-filenames", "--no-part", "--no-playlist", "--no-live-from-start",
+        "--print", "before_dl:chosen=%(format_id)s | %(resolution)s | tbr=%(tbr)s | protocol=%(protocol)s",
+        "--retries", "20", "--extractor-retries", "20", "--file-access-retries", "20",
+        "--fragment-retries", "infinite", "--retry-sleep", "http:2", "--retry-sleep", "fragment:1",
+        "--skip-unavailable-fragments", "--hls-use-mpegts", "--downloader", "m3u8:native", "-N", "1",
+        "-f", FORMAT_SELECTOR, "-S", SORT_EXPR, "-o", chunk_path,
+    ] + JS_ARGS
+
+    if client:
+        command += ["--extractor-args", f"youtube:player_client={client}"]
+    if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE):
+        command += ["--cookies", COOKIE_FILE]
+    command.append(active["live_url"])
+    return command
+
+
+def current_saved_path(base_path):
+    if os.path.isfile(base_path):
+        return base_path
+    part_path = base_path + ".part"
+    return part_path if os.path.isfile(part_path) else None
+
+
+def finalize_download_path(base_path):
+    path = current_saved_path(base_path)
+    if path and path.endswith(".part"):
+        try:
+            os.replace(path, base_path)
+            return base_path
+        except Exception:
+            return path
+    return path
+
+
+def append_chunk(active, path, client, reason):
+    if path not in active["chunks"]:
+        active["chunks"].append(path)
+    active["chunks"].sort(key=chunk_number)
+    active["chunk_index"] = max(active["chunk_index"], chunk_number(path) + 1)
+    active["preferred_client"] = client
+    active["client_locked"] = True
+    active["recording_path"] = None
+    active["last_failure_reason"] = None
+    active["short_exit_streak"] = 0
+    active["recovery_needed"] = False
+    active["cooldown_until"] = 0
+    active["offline_since"] = None
+    save_active_state(active)
+
+    total_mb = sum(os.path.getsize(item) for item in active["chunks"] if os.path.isfile(item)) / 1048576
+    log(f"chunk_saved | reason={reason} | client={client_label(client)} | chunk={chunk_number(path):04d} | {os.path.getsize(path) / 1048576:.1f} MB | total={total_mb:.1f} MB")
+    write_summary(video_id=active["live_id"], client_used=client_label(client), status="recording", chunk_count=len(active["chunks"]))
+
+
+def take_replacement_live(active, live_queue):
+    replacement = None
+    try:
+        while True:
+            candidate = live_queue.get_nowait()
+            if candidate and candidate.get("id") and candidate.get("id") != active["live_id"]:
+                replacement = candidate
+    except Empty:
+        pass
+    return replacement
+
+
+def drain_latest_candidate(live_queue):
+    latest = None
+    try:
+        while True:
+            candidate = live_queue.get_nowait()
+            if candidate and candidate.get("id"):
+                latest = candidate
+    except Empty:
+        pass
+    return latest
+
+
+def run_download_attempt(active, session_end, client, live_queue):
+    global CURRENT_PROC, STOP_REQUESTED, DISK_LIMIT_REACHED
+    if shutil.disk_usage(OUT_DIR).free < MIN_FREE_DISK_BYTES:
+        DISK_LIMIT_REACHED = True
+        STOP_REQUESTED = True
+        log("disk_floor_reached | stopping capture safely to preserve recorded chunks")
+        return False, "termination", None
+
+    index = active["chunk_index"]
+    chunk_path = build_chunk_path(active, index)
+    active["recording_path"] = chunk_path
+    save_active_state(active)
+
+    command = make_download_cmd(active, chunk_path, client)
+    left = max(0, session_end - time.time())
+    log(f"[{hms(left)} left] download_started | chunk={index:04d} | client={client_label(client)}")
+
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
+    except Exception as exc:
+        log_raw("download_launch_error", exc)
+        active["recording_path"] = None
+        save_active_state(active)
+        return False, "launch_error", None
+
+    with CURRENT_PROC_LOCK:
+        CURRENT_PROC = process
+    DOWNLOAD_ACTIVE.set()
+
+    output_state = {"botcheck": False, "no_formats": False, "rate_limited": False, "not_live": False, "normal_exit": False}
+    reader = threading.Thread(target=output_reader, args=(process.stdout, output_state), daemon=True)
+    reader.start()
+
+    started_at = time.time()
+    last_heartbeat = 0
+    last_size = -1
+    last_growth_at = started_at
+    stop_reason = None
+    replacement_live = None
+
+    try:
+        while process.poll() is None and time.time() < session_end and not STOP_REQUESTED:
+            time.sleep(POLL_INTERVAL_SECONDS)
+            now = time.time()
 
             if shutil.disk_usage(OUT_DIR).free < MIN_FREE_DISK_BYTES:
-                log("Low disk space reached -> stopping capture safely to preserve media")
+                DISK_LIMIT_REACHED = True
                 STOP_REQUESTED = True
-                return recorded_chunks
-
-            chunk_name = f"{CHANNEL_HANDLE.lstrip('@')}_{video_id}_s{session_idx:02d}_part{chunk_idx:03d}.mp4"
-            chunk_path = OUT_DIR / chunk_name
-            log(f"Starting capture | file={chunk_name} | client={client_label(client)} | cookies={use_c}")
-
-            cmd = build_yt_dlp_base(client, use_c) + [
-                "-o", str(chunk_path),
-                url,
-            ]
-
-            proc = None
-            state = {"last_output_ts": time.time()}
-            last_size = 0
-            last_growth_ts = time.time()
-
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                )
-                reader = threading.Thread(target=_stream_reader, args=(proc, state), daemon=True)
-                reader.start()
-
-                while True:
-                    if now_deadline_passed() or STOP_REQUESTED:
-                        log("Window deadline or stop signal reached -> stopping yt-dlp gracefully")
-                        stop_proc_gracefully(proc, timeout=20)
-                        break
-
-                    if shutil.disk_usage(OUT_DIR).free < MIN_FREE_DISK_BYTES:
-                        log("Disk limit reached during capture -> stopping yt-dlp gracefully")
-                        STOP_REQUESTED = True
-                        stop_proc_gracefully(proc, timeout=20)
-                        break
-
-                    if proc.poll() is not None:
-                        break
-
-                    sz = current_file_size(chunk_path)
-                    if sz > last_size:
-                        last_size = sz
-                        last_growth_ts = time.time()
-                    elif time.time() - last_growth_ts > STALL_TIMEOUT_SEC:
-                        log(f"Stall detected ({STALL_TIMEOUT_SEC}s with no new bytes) -> rotating client")
-                        stop_proc_gracefully(proc, timeout=15)
-                        break
-
-                    time.sleep(1.0)
-
-            except Exception as e:
-                log(f"Capture exception: {e}")
-                stop_proc_gracefully(proc, timeout=5)
-            finally:
-                stop_proc_gracefully(proc, timeout=5)
-
-            final_chunk = finalize_part_file(chunk_path)
-            if final_chunk.exists() and final_chunk.stat().st_size > 100_000:
-                sz_mb = final_chunk.stat().st_size / 1e6
-                log(f"Saved chunk {final_chunk.name} ({sz_mb:.1f} MB)")
-                recorded_chunks.append(final_chunk)
-                chunk_idx += 1
-                if now_deadline_passed() or STOP_REQUESTED:
-                    return recorded_chunks
-                reprobe = probe_live(CHANNEL_HANDLE)
-                if not reprobe or reprobe["id"] != video_id:
-                    log("Stream ended or switched video_id -> returning to monitor loop")
-                    return recorded_chunks
-
-    return recorded_chunks
-
-
-def write_summary(videos: list[str], files: list[Path], success: bool) -> None:
-    total_bytes = sum(f.stat().st_size for f in files if f.exists())
-    summary = {
-        "channel": CHANNEL_HANDLE,
-        "video_ids": videos,
-        "video_id": videos[0] if videos else "none",
-        "files": [str(f.name) for f in files if f.exists()],
-        "size_bytes": total_bytes,
-        "success": success,
-        "live_detected": LIVE_DETECTED_EVER,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    summary_path = OUT_DIR / "recording_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    log(f"Summary written -> {summary_path} ({total_bytes / 1e6:.1f} MB total)")
-
-
-def main() -> int:
-    global LIVE_DETECTED_EVER, STOP_REQUESTED, FALLBACK_NOTIFIED
-
-    def _sig_handler(signum, frame):
-        global STOP_REQUESTED
-        log(f"Signal {signum} received -> graceful stop")
-        STOP_REQUESTED = True
-
-    signal.signal(signal.SIGINT, _sig_handler)
-    signal.signal(signal.SIGTERM, _sig_handler)
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    log("=== God-level Recorder (v3 Hardened) Start ===")
-    log(f"Channel: {CHANNEL_HANDLE}")
-    log(f"Cookies available: {cookies_available()}")
-    log(f"JS Runtime Args: {JS_ARGS}")
-    log(f"Deadline: {SESSION_DEADLINE or 'MAX_RUNTIME'}")
-    log(f"Remaining window time: {remaining_seconds()}s")
-
-    if not cookies_available():
-        FALLBACK_NOTIFIED = True
-        tg.fallback_mode(CHANNEL_HANDLE, "No cookies configured – using default + mobile client mode")
-
-    all_files: list[Path] = []
-    seen_videos: list[str] = []
-    session_idx = 1
-    probe_count = 0
-
-    while not now_deadline_passed() and not STOP_REQUESTED:
-        probe_count += 1
-        probe = probe_live(CHANNEL_HANDLE)
-
-        if not probe:
-            rem = remaining_seconds()
-            if rem <= 5:
+                stop_reason = "low_disk"
+                log("disk_floor_reached_mid_stream | stopping download safely")
+                stop_proc(process)
                 break
-            sleep_sec = min(PROBE_INTERVAL_SEC, rem)
-            if probe_count == 1 or probe_count % 10 == 0:
-                log(f"Channel {CHANNEL_HANDLE} offline (probe #{probe_count}) -> monitoring ({rem}s left in window)...")
-            time.sleep(sleep_sec)
+
+            replacement_live = take_replacement_live(active, live_queue)
+            if replacement_live:
+                stop_reason = "new_live_id"
+                log(f"replacement_live_detected | old={active['live_id']} | new={replacement_live['id']}")
+                stop_proc(process)
+                break
+
+            path = current_saved_path(chunk_path)
+            size = os.path.getsize(path) if path else 0
+            if size > last_size:
+                last_size, last_growth_at = size, now
+
+            if now - last_heartbeat >= HEARTBEAT_SECONDS:
+                log(f"[{hms(session_end - now)} left] heartbeat | chunk={index:04d} | client={client_label(client)} | {size / 1048576:.1f} MB")
+                last_heartbeat = now
+
+            if now - last_growth_at >= STALL_SECONDS:
+                stop_reason = "stalled"
+                log(f"download_stalled | chunk={index:04d} | no_growth={now - last_growth_at:.0f}s | restarting from live edge")
+                stop_proc(process)
+                break
+    finally:
+        if process.poll() is None:
+            stop_proc(process)
+        with CURRENT_PROC_LOCK:
+            CURRENT_PROC = None
+        DOWNLOAD_ACTIVE.clear()
+
+    reader.join(timeout=8)
+    duration = time.time() - started_at
+    saved_path = finalize_download_path(chunk_path)
+    saved_bytes = os.path.getsize(saved_path) if (saved_path and os.path.isfile(saved_path)) else 0
+    explicit_end = output_state["not_live"] or output_state["normal_exit"]
+
+    unexpected_short_exit = (
+        stop_reason is None
+        and duration < SHORT_EXIT_PROTECTION_SECONDS
+        and not explicit_end
+        and not STOP_REQUESTED
+        and time.time() < session_end
+    )
+
+    if unexpected_short_exit:
+        if saved_path and os.path.isfile(saved_path):
+            archived = archive_short_exit(active, saved_path)
+            active["short_exit_streak"] = int(active.get("short_exit_streak", 0)) + 1
+            active["recording_path"] = None
+            save_active_state(active)
+            log(f"short_exit_detected | client={client_label(client)} | duration={duration:.1f}s | size={saved_bytes / 1048576:.1f}MB | archived={os.path.basename(archived) if archived else 'none'}")
+        else:
+            active["short_exit_streak"] = int(active.get("short_exit_streak", 0)) + 1
+            active["recording_path"] = None
+            save_active_state(active)
+            log(f"short_exit_detected | client={client_label(client)} | duration={duration:.1f}s | size=0.0MB | archived=none")
+        return False, "short_exit", replacement_live
+
+    if saved_path and os.path.isfile(saved_path) and saved_bytes >= MIN_SAVE_BYTES:
+        if STOP_REQUESTED: reason = "termination"
+        elif time.time() >= session_end: reason = "session_end"
+        elif stop_reason == "new_live_id": reason = "new_live_id"
+        elif explicit_end: reason = classify_output(output_state)
+        elif stop_reason == "stalled": reason = "stalled"
+        else: reason = "downloader_exit"
+
+        append_chunk(active, saved_path, client, reason)
+        if replacement_live: return True, "new_live_id", replacement_live
+        if reason in {"termination", "session_end", "not_live", "normal_end"}: return True, reason, None
+        return True, reason, None
+
+    if saved_path and os.path.isfile(saved_path):
+        try: os.remove(saved_path)
+        except Exception: pass
+
+    active["recording_path"] = None
+    reason = classify_output(output_state)
+    if stop_reason and reason == "no_file":
+        reason = stop_reason
+    log(f"download_failed | client={client_label(client)} | reason={reason} | duration={duration:.1f}s")
+    return False, reason, replacement_live
+
+
+def record_until_stop(active, session_end, live_queue):
+    if active.get("client_locked") and active.get("preferred_client") in DOWNLOAD_CLIENTS:
+        preferred = active["preferred_client"]
+        clients = [preferred] + [c for c in DOWNLOAD_CLIENTS if c != preferred]
+    else:
+        clients = list(DOWNLOAD_CLIENTS)
+
+    last_reason = "download_failed"
+    for client in clients:
+        short_attempts = int(active.get("short_exit_streak", 0)) if client == active.get("preferred_client") else 0
+        while time.time() < session_end and not STOP_REQUESTED:
+            ok, reason, replacement_live = run_download_attempt(active, session_end, client, live_queue)
+            if replacement_live: return False, "new_live_id", replacement_live
+            if STOP_REQUESTED: return False, "termination", None
+            if time.time() >= session_end: return False, "session_end", None
+            if reason in {"not_live", "normal_end"}: return False, reason, None
+            last_reason = reason
+
+            if reason == "short_exit":
+                short_attempts += 1
+                if short_attempts <= SHORT_EXIT_RETRIES:
+                    log(f"short_exit_retry | client={client_label(client)} | retry={short_attempts}/{SHORT_EXIT_RETRIES} | waiting={SHORT_EXIT_BACKOFF_SECONDS}s")
+                    time.sleep(SHORT_EXIT_BACKOFF_SECONDS)
+                    continue
+                log(f"short_exit_limit_reached | client={client_label(client)} | moving to next client")
+                break
+
+            if ok and reason in {"stalled", "downloader_exit"}:
+                short_attempts = 0
+                if reason == "stalled":
+                    time.sleep(STALL_RETRY_BACKOFF_SECONDS)
+                continue
+            break
+
+        if client != clients[-1] and last_reason not in {"not_live", "normal_end"}:
+            log(f"client_fallback_wait | {CLIENT_SWITCH_DELAY_SECONDS}s before fallback")
+            time.sleep(CLIENT_SWITCH_DELAY_SECONDS)
+
+    active["last_failure_reason"] = last_reason
+    active["recovery_needed"] = True
+    save_active_state(active)
+    return False, last_reason, None
+
+
+def primary_detector(session_end, stop_event, live_queue):
+    next_run = time.time()
+    while not stop_event.is_set() and time.time() < session_end and not STOP_REQUESTED:
+        if time.time() < next_run:
+            time.sleep(1)
             continue
+        try:
+            payload = probe_fast()
+            if payload:
+                live_queue.put(payload)
+        except Exception as exc:
+            log_raw("primary_detector_error", exc)
 
-        vid = probe["id"]
-        c_label = client_label(probe["client"])
-        if vid not in seen_videos:
-            seen_videos.append(vid)
-        LIVE_DETECTED_EVER = True
-        log(f"🔴 LIVE DETECTED | id={vid} | client={c_label} | cookies={probe['used_cookies']}")
-        tg.live_detected(CHANNEL_HANDLE, vid, c_label)
-
-        if not probe["used_cookies"] and cookies_available() and not FALLBACK_NOTIFIED:
-            FALLBACK_NOTIFIED = True
-            tg.fallback_mode(CHANNEL_HANDLE, f"Cookies present but stream captured via {c_label} client")
-
-        chunks = record_stream(vid, session_idx, probe["client"])
-        all_files.extend(chunks)
-        session_idx += 1
-
-        if not now_deadline_passed() and not STOP_REQUESTED:
-            time.sleep(5)
-
-    if not all_files:
-        log("NO_RECORDING: Channel remained offline throughout this shift window.")
-        write_summary(seen_videos, [], False)
-        (OUT_DIR / "NO_RECORDING").write_text("Channel was offline during shift window\n", encoding="utf-8")
-        return 0
-
-    total_gb = sum(f.stat().st_size for f in all_files if f.exists()) / 1e9
-    write_summary(seen_videos, all_files, True)
-    log(f"✅ Window capture finished | {len(all_files)} file(s) | {total_gb:.2f} GB total")
-    return 0
+        interval = ACTIVE_SESSION_RECHECK_SECONDS if (SESSION_ACTIVE.is_set() and DOWNLOAD_ACTIVE.is_set()) else PRIMARY_RECHECK_SECONDS
+        next_run = time.time() + interval
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+def secondary_detector(session_end, stop_event, live_queue):
+    next_run = time.time() + 10
+    while not stop_event.is_set() and time.time() < session_end and not STOP_REQUESTED:
+        if time.time() < next_run:
+            time.sleep(1)
+            continue
+        try:
+            payload = probe_secondary()
+            if payload:
+                live_queue.put(payload)
+        except Exception as exc:
+            log_raw("secondary_detector_error", exc)
+
+        interval = SECONDARY_ACTIVE_RECHECK_SECONDS if (SESSION_ACTIVE.is_set() and DOWNLOAD_ACTIVE.is_set()) else SECONDARY_WAITING_RECHECK_SECONDS
+        next_run = time.time() + interval
+
+
+def wait_for_start_time():
+    value = str(START_AT_IST or "").strip()
+    if not value or ZoneInfo is None:
+        return
+    try:
+        hour, minute = map(int, value.split(":"))
+        tz = ZoneInfo("Asia/Kolkata")
+        now = datetime.now(tz)
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        seconds = (target - now).total_seconds()
+        log(f"scheduled_start | IST={target.strftime('%Y-%m-%d %H:%M:%S')} | waiting={hms(seconds)}")
+        while seconds > 0 and not STOP_REQUESTED:
+            time.sleep(min(5, seconds))
+            now = datetime.now(tz)
+            seconds = (target - now).total_seconds()
+    except Exception as exc:
+        log_raw("start_time_error", f"invalid START_AT_IST={value!r} | {exc}")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+install_dependencies()
+JS_ARGS = js_runtime_args()
+resolve_target_identity()
+wait_for_start_time()
+
+session_end = time.time() + HOURS * 3600
+active = load_active_state()
+
+live_queue = Queue()
+stop_event = threading.Event()
+
+primary_thread = threading.Thread(target=primary_detector, args=(session_end, stop_event, live_queue), daemon=True)
+secondary_thread = threading.Thread(target=secondary_detector, args=(session_end, stop_event, live_queue), daemon=True)
+
+primary_thread.start()
+secondary_thread.start()
+
+log(f"started | channel={CHANNEL_HANDLE} | id={TARGET_CHANNEL_ID} | duration={HOURS}h | cookies={USE_COOKIES} | stall=240s")
+
+try:
+    while time.time() < session_end and not STOP_REQUESTED:
+        now = time.time()
+        candidate = drain_latest_candidate(live_queue)
+
+        if candidate:
+            if active is None:
+                active = new_session(candidate)
+            elif candidate["id"] != active["live_id"]:
+                close_session(active, "new target live ID detected")
+                active = new_session(candidate)
+            else:
+                active["offline_since"] = None
+                active["cooldown_until"] = 0
+                active["recovery_needed"] = False
+                save_active_state(active)
+
+        if active:
+            active["live_url"] = f"https://www.youtube.com/watch?v={active['live_id']}"
+            if (
+                not DOWNLOAD_ACTIVE.is_set()
+                and now >= active.get("cooldown_until", 0)
+                and (active.get("recovery_needed", False) or not active.get("chunks") or candidate is not None)
+            ):
+                recorded, reason, replacement_live = record_until_stop(active, session_end, live_queue)
+                if replacement_live:
+                    close_session(active, "new target live ID detected while recording")
+                    active = new_session(replacement_live)
+                    continue
+
+                if reason in {"termination", "session_end"}:
+                    break
+
+                if reason in {
+                    "not_live", "normal_end", "download_failed", "launch_error",
+                    "botcheck", "rate_limited", "no_formats", "no_file", "short_exit",
+                }:
+                    active["recovery_needed"] = True
+                    active["last_failure_reason"] = reason
+                    active["cooldown_until"] = time.time() + FAILURE_COOLDOWN_SECONDS
+                    save_active_state(active)
+                    log(f"recovery_cooldown | reason={reason} | waiting={FAILURE_COOLDOWN_SECONDS}s")
+                    if active["offline_since"] is None:
+                        active["offline_since"] = time.time()
+                        save_active_state(active)
+
+            if (
+                active
+                and active.get("offline_since") is not None
+                and (time.time() - active["offline_since"]) >= OFFLINE_GRACE_SECONDS
+                and not DOWNLOAD_ACTIVE.is_set()
+            ):
+                close_session(active, f"offline for {OFFLINE_GRACE_SECONDS}s")
+                active = None
+
+        time.sleep(1)
+
+finally:
+    stop_event.set()
+    primary_thread.join(timeout=5)
+    secondary_thread.join(timeout=5)
+    with CURRENT_PROC_LOCK:
+        process = CURRENT_PROC
+    stop_proc(process)
+    DOWNLOAD_ACTIVE.clear()
+
+if active:
+    close_session(active, "session complete")
+
+log("session_complete")
