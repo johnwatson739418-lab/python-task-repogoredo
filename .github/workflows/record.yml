@@ -22,11 +22,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - "@Apka-aashu|UCGFi8l9sf5ab4hVJf7byBZg"
-          - "@baskarfiroz15|UCSuA9LrSsE4-GSaSYDUZhNw"
-          - "@anshhhlive_1|UC3NiNPo4kJYnYYhV_6ZnUGw"
-          - "@BagadBillagang-p6s|UC6_0vYIN2dy3MvBuUSvtZJg"
-          - "@_heyb7|UCiFH1EwIHWmPayYRuDGOHPA"
+          - "@GOREDOXLIVE|UC8MRu8goXUOM-_YaGsUvsmQ"
 
     steps:
       - name: Checkout Repository
@@ -49,12 +45,7 @@ jobs:
           INPUT_HOURS: ${{ github.event.inputs.hours || '4.0' }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
-          # If custom_target is provided, run only on the first matrix slot and skip the rest
           if [ -n "$CUSTOM_TARGET" ]; then
-            if [ "$TARGET_DATA" != "@Apka-aashu|UCGFi8l9sf5ab4hVJf7byBZg" ]; then
-              echo "Skipping secondary matrix slot because custom_target override is active."
-              exit 0
-            fi
             TARGET_DATA="$CUSTOM_TARGET"
           fi
 
@@ -83,6 +74,12 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          # 1. Stop any lingering downloader/encoder processes and flush file buffers
+          pkill -9 -f ffmpeg 2>/dev/null || true
+          pkill -9 -f yt-dlp 2>/dev/null || true
+          sleep 2
+          sync 2>/dev/null || true
+
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq curl rclone
           mkdir -p ./streams

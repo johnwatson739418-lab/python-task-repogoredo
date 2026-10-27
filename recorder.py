@@ -553,15 +553,32 @@ def stop_proc(process):
     if not process:
         return
     try:
-        if process.poll() is not None:
-            return
-        process.terminate()
-        process.wait(timeout=10)
-        return
+        if process.poll() is None:
+            if sys.platform != "win32":
+                try:
+                    pgid = os.getpgid(process.pid)
+                    os.killpg(pgid, signal.SIGTERM)
+                except Exception:
+                    process.terminate()
+            else:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except Exception:
+                if sys.platform != "win32":
+                    try:
+                        pgid = os.getpgid(process.pid)
+                        os.killpg(pgid, signal.SIGKILL)
+                    except Exception:
+                        process.kill()
+                else:
+                    process.kill()
+                process.wait(timeout=2)
     except Exception:
+        pass
+    if sys.platform != "win32":
         try:
-            process.kill()
-            process.wait(timeout=5)
+            subprocess.run(["pkill", "-9", "-f", "ffmpeg"], capture_output=True, timeout=2)
         except Exception:
             pass
 
@@ -930,7 +947,16 @@ def run_download_attempt(active, session_end, client, live_queue):
     log(f"[{hms(left)} left] download_started | chunk={index:04d} | client={client_label(client)}")
 
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            start_new_session=(sys.platform != "win32"),
+        )
     except Exception as exc:
         log_raw("download_launch_error", exc)
         active["recording_path"] = None
