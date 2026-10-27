@@ -61,12 +61,13 @@ VALIDATION_CLIENTS: list[Optional[str]] = [
     "android",
 ]
 
-# Pre-merged HLS mpegts stream first, with full best video+audio fallback
+# Support separate video+audio streams (bv+ba) as well as pre-merged (b)
 FORMAT_SELECTOR = (
-    "b[height<=1080][height>=480][protocol*=m3u8]/"
-    "b[height<=720][protocol*=m3u8]/"
-    "b[protocol*=m3u8]/"
+    "bv*[height<=1080]+ba/"
     "b[height<=1080]/"
+    "bv*[height<=720]+ba/"
+    "b[height<=720]/"
+    "bv*+ba/"
     "b/best"
 )
 
@@ -81,7 +82,10 @@ FALLBACK_NOTIFIED = False
 
 def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    try:
+        print(f"[{ts}] {msg}", flush=True)
+    except UnicodeEncodeError:
+        print(f"[{ts}] {msg.encode('ascii', errors='replace').decode('ascii')}", flush=True)
 
 
 def client_label(client: Optional[str]) -> str:
@@ -193,9 +197,7 @@ def build_yt_dlp_base(client: Optional[str], with_cookies: bool) -> list[str]:
         "--retry-sleep", "http:2",
         "--retry-sleep", "fragment:1",
         "--skip-unavailable-fragments",
-        "--hls-use-mpegts",
-        "--downloader", "m3u8:native",
-        "-N", "1",
+        "--merge-output-format", "mp4",
         "-f", FORMAT_SELECTOR,
     ] + JS_ARGS
     if client:
@@ -316,8 +318,10 @@ def _stream_reader(proc: subprocess.Popen, state: dict) -> None:
 def current_file_size(base_path: Path) -> int:
     """Check size of base_path or any .part / format variant."""
     total = 0
-    for candidate in (base_path, Path(str(base_path) + ".part")):
-        if candidate.exists():
+    parent = base_path.parent
+    stem = base_path.stem
+    if parent.exists():
+        for candidate in parent.glob(f"{stem}*"):
             try:
                 total = max(total, candidate.stat().st_size)
             except OSError:
@@ -326,10 +330,17 @@ def current_file_size(base_path: Path) -> int:
 
 
 def finalize_part_file(base_path: Path) -> Path:
+    parent = base_path.parent
+    stem = base_path.stem
+    if parent.exists():
+        for candidate in parent.glob(f"{stem}*"):
+            if candidate.is_file() and not candidate.name.endswith(".part"):
+                return candidate
     part_path = Path(str(base_path) + ".part")
-    if part_path.exists() and not base_path.exists():
+    if part_path.exists():
         try:
             part_path.replace(base_path)
+            return base_path
         except OSError:
             return part_path
     return base_path
@@ -376,7 +387,7 @@ def record_stream(video_id: str, session_idx: int, preferred_client: Optional[st
                 STOP_REQUESTED = True
                 return recorded_chunks
 
-            chunk_name = f"{CHANNEL_HANDLE.lstrip('@')}_{video_id}_s{session_idx:02d}_part{chunk_idx:03d}.ts"
+            chunk_name = f"{CHANNEL_HANDLE.lstrip('@')}_{video_id}_s{session_idx:02d}_part{chunk_idx:03d}.mp4"
             chunk_path = OUT_DIR / chunk_name
             log(f"Starting capture | file={chunk_name} | client={client_label(client)} | cookies={use_c}")
 
