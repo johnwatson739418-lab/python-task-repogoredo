@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       hours:
-        description: "Recording duration per shift in hours (default 4.0; use 0.2 for a 12-min test)"
+        description: "Recording duration per shift in hours (default 3.0; use 0.2 for a 12-min test)"
         required: false
-        default: "4.0"
+        default: "3.0"
         type: string
       shifts_left:
-        description: "Auto-restart shifts if streamer is still live at 4h cap (default 1 = up to 8h total)"
+        description: "Continuation shifts if still live at 3h cap (default 1 = up to 8h total; auto-disabled if hours < 1.0)"
         required: false
         default: "1"
         type: string
@@ -51,10 +51,11 @@ jobs:
         env:
           TARGET_DATA: ${{ matrix.target }}
           CUSTOM_TARGET: ${{ github.event.inputs.custom_target }}
-          INPUT_HOURS: ${{ github.event.inputs.hours || '4.0' }}
-          SHIFTS_LEFT: ${{ github.event.inputs.shifts_left || '1' }}
+          INPUT_HOURS: ${{ github.event.inputs.hours || '3.0' }}
+          INPUT_SHIFTS_LEFT: ${{ github.event.inputs.shifts_left || '1' }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           if [ -n "$CUSTOM_TARGET" ]; then
             TARGET_DATA="$CUSTOM_TARGET"
@@ -71,36 +72,40 @@ jobs:
 
           export CHANNEL_HANDLE=$(echo "$TARGET_DATA" | cut -d'|' -f1)
           export TARGET_CHANNEL_ID=$(echo "$TARGET_DATA" | cut -d'|' -f2)
-          export HOURS="${INPUT_HOURS:-4.0}"
+          export HOURS="${INPUT_HOURS:-3.0}"
           export OUT_DIR="./streams"
+
+          # Disable auto-continuation on short tests (< 1.0 hour) so a 12-min @DWNews test doesn't spawn another run
+          export SHIFTS_LEFT=$(python3 -c "h=float('${HOURS}'); s=int('${INPUT_SHIFTS_LEFT:-0}' or 0); print(0 if h < 1.0 else max(0, s))")
+          export ACTIVE_TARGET_DATA="$TARGET_DATA"
 
           echo "CHANNEL_HANDLE=$CHANNEL_HANDLE" >> "$GITHUB_ENV"
           echo "ACTIVE_TARGET_DATA=$TARGET_DATA" >> "$GITHUB_ENV"
           python3 recorder.py
 
-          # Auto-restart continuation shift IMMEDIATELY (before upload) if streamer was still live at 4h cap
-          STILL_LIVE=$(python3 - <<'PY'
+          # Fallback dispatch if pre-warm didn't already fire 3m before end, stream is confirmed live, and SHIFTS_LEFT > 0
+          NEED_DISPATCH=$(python3 - <<'PY'
           import glob, json
           for p in glob.glob("./streams/*_summary.json"):
               try:
                   d = json.loads(open(p, encoding="utf-8").read())
-                  if d.get("still_live_at_end"):
+                  if d.get("still_live_at_end") and not d.get("continuation_dispatched"):
                       print("true")
                       break
               except Exception:
                   pass
           PY
           )
-          if [ "$STILL_LIVE" == "true" ] && [ "${SHIFTS_LEFT:-0}" -gt 0 ] 2>/dev/null; then
+          if [ "$NEED_DISPATCH" == "true" ] && [ "${SHIFTS_LEFT:-0}" -gt 0 ] 2>/dev/null; then
             NEXT_SHIFTS=$((SHIFTS_LEFT - 1))
-            echo "Streamer $CHANNEL_HANDLE is still live at shift end -> dispatching continuation shift (shifts_left=$NEXT_SHIFTS)..."
+            echo "Streamer $CHANNEL_HANDLE confirmed still live at shift end -> dispatching continuation shift (shifts_left=$NEXT_SHIFTS)..."
             gh workflow run record.yml --ref "${GITHUB_REF_NAME}" \
               -f hours="${HOURS}" \
               -f shifts_left="${NEXT_SHIFTS}" \
               -f custom_target="${TARGET_DATA}" || true
           fi
 
-      - name: Auto-Upload to Gofile (Fallback to Google Drive)
+      - name: Auto-Upload to Gofile (Bounded Budget + Fallback to Google Drive)
         if: always()
         env:
           RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG }}
@@ -122,7 +127,6 @@ jobs:
           sudo apt-get install -y -qq jq curl rclone
           mkdir -p ./streams
 
-          # Collect all valid media files > 1MB (both merged top-level files and any unmerged _chunks)
           mapfile -t FILES < <(find ./streams -type f \( -name "*.ts" -o -name "*.part" -o -name "*.mp4" \) ! -name "*_short_exit_*" -size +1M | sort)
 
           if [ "${#FILES[@]}" -eq 0 ]; then
@@ -160,34 +164,46 @@ jobs:
 
           echo "### Recording Upload Summary: \`${CHANNEL_HANDLE}\`" >> "$GITHUB_STEP_SUMMARY"
 
+          # Total Gofile time budget across all files = 1800s (30 min), guaranteeing >= 65 min for Drive fallback
+          GOFILE_DEADLINE=$(( $(date +%s) + 1800 ))
+          RUN_UTC_TAG=$(date -u +"%Y%m%d_%H%MUTC")
+
           for f in "${FILES[@]}"; do
             FNAME=$(basename "$f")
             FSIZE_MB=$(du -m "$f" | cut -f1)
             UPLOAD_LINK=""
             UPLOAD_METHOD=""
+            STATUS=""
 
             echo "--------------------------------------------------"
-            echo "1) Attempting Gofile upload for $FNAME (${FSIZE_MB} MB)..."
+            NOW_TS=$(date +%s)
+            GOFILE_REM=$(( GOFILE_DEADLINE - NOW_TS ))
 
-            AUTH_ARGS=()
-            if [ -n "$GOFILE_TOKEN" ]; then
-              AUTH_ARGS=(-H "Authorization: Bearer $GOFILE_TOKEN")
-            fi
+            if [ "$GOFILE_REM" -gt 120 ]; then
+              ATTEMPT1_MAX=$(( GOFILE_REM < 1200 ? GOFILE_REM : 1200 ))
+              echo "1) Attempting Gofile upload for $FNAME (${FSIZE_MB} MB, budget=${ATTEMPT1_MAX}s)..."
 
-            # 40-min max ceiling for 5GB+ files, but fast 45s abort if transfer stalls < 500 KB/s
-            CURL_SPEED_ARGS=(--connect-timeout 20 --max-time 2400 --speed-limit 500000 --speed-time 45)
-
-            RESP=$(curl -s "${CURL_SPEED_ARGS[@]}" "${AUTH_ARGS[@]}" -X POST "https://upload.gofile.io/uploadfile" -F "file=@$f" || true)
-            STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null || true)
-
-            # Secondary Gofile server lookup if global endpoint didn't return ok
-            if [ "$STATUS" != "ok" ]; then
-              SERVER=$(curl -s --max-time 15 "https://api.gofile.io/servers" | jq -r '.data.servers[0].name // empty' 2>/dev/null || true)
-              if [ -n "$SERVER" ]; then
-                echo "Retrying Gofile via server ${SERVER}.gofile.io..."
-                RESP=$(curl -s "${CURL_SPEED_ARGS[@]}" "${AUTH_ARGS[@]}" -X POST "https://${SERVER}.gofile.io/uploadFile" -F "file=@$f" || true)
-                STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null || true)
+              AUTH_ARGS=()
+              if [ -n "$GOFILE_TOKEN" ]; then
+                AUTH_ARGS=(-H "Authorization: Bearer $GOFILE_TOKEN")
               fi
+
+              RESP=$(curl -s --connect-timeout 20 --max-time "$ATTEMPT1_MAX" "${AUTH_ARGS[@]}" -X POST "https://upload.gofile.io/uploadfile" -F "file=@$f" || true)
+              STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null || true)
+
+              NOW_TS=$(date +%s)
+              GOFILE_REM=$(( GOFILE_DEADLINE - NOW_TS ))
+              if [ "$STATUS" != "ok" ] && [ "$GOFILE_REM" -gt 120 ]; then
+                ATTEMPT2_MAX=$(( GOFILE_REM < 900 ? GOFILE_REM : 900 ))
+                SERVER=$(curl -s --max-time 15 "https://api.gofile.io/servers" | jq -r '.data.servers[0].name // empty' 2>/dev/null || true)
+                if [ -n "$SERVER" ]; then
+                  echo "Retrying Gofile via server ${SERVER}.gofile.io (budget=${ATTEMPT2_MAX}s)..."
+                  RESP=$(curl -s --connect-timeout 20 --max-time "$ATTEMPT2_MAX" "${AUTH_ARGS[@]}" -X POST "https://${SERVER}.gofile.io/uploadFile" -F "file=@$f" || true)
+                  STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null || true)
+                fi
+              fi
+            else
+              echo "Gofile 30-min shared budget exhausted -> skipping directly to Google Drive fallback."
             fi
 
             if [ "$STATUS" == "ok" ]; then
@@ -199,13 +215,18 @@ jobs:
               echo "Download Link: $UPLOAD_LINK"
               echo "=================================================="
             else
-              echo "Gofile upload failed ($RESP). Falling back to Google Drive..."
+              echo "Gofile upload did not succeed. Falling back to Google Drive..."
 
               # 2) Fallback to Google Drive via rclone (strictly verified type = drive remote)
               if [ -n "$RCLONE_CONF" ] && [ -n "$DRIVE_REMOTE" ]; then
                 CLEAN_CH="${CHANNEL_HANDLE#@}"
                 DATE_DIR=$(date -u +"%Y-%m-%d")
-                REMOTE_PATH="${DRIVE_REMOTE}:YouTubeRecordings/${CLEAN_CH}/${DATE_DIR}/${FNAME}"
+                # Ensure unique filename on Drive across shifts so Shift 2 never overwrites Shift 1
+                case "$FNAME" in
+                  *UTC*) DRIVE_FNAME="$FNAME" ;;
+                  *) DRIVE_FNAME="${RUN_UTC_TAG}_${FNAME}" ;;
+                esac
+                REMOTE_PATH="${DRIVE_REMOTE}:YouTubeRecordings/${CLEAN_CH}/${DATE_DIR}/${DRIVE_FNAME}"
 
                 echo "Uploading to Google Drive -> $REMOTE_PATH ..."
                 if rclone --config "$RCLONE_CONF" copyto "$f" "$REMOTE_PATH" --drive-chunk-size 32M --transfers 1 --retries 3 --low-level-retries 5; then
@@ -218,7 +239,7 @@ jobs:
                   UPLOAD_METHOD="Google Drive"
                   echo "=================================================="
                   echo "GOOGLE DRIVE FALLBACK UPLOAD SUCCESSFUL!"
-                  echo "File: $FNAME (${FSIZE_MB} MB)"
+                  echo "File: $DRIVE_FNAME (${FSIZE_MB} MB)"
                   echo "Drive Link: $UPLOAD_LINK"
                   echo "=================================================="
                 else

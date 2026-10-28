@@ -1,12 +1,11 @@
 """
-YouTube Live Recorder -- Cloud Runner Engine (v4 Hardened 2-File Edition)
-Incorporates all verified fixes from live runs + Claude & ChatGPT audits:
-1. Fixed short_chunk_preserved missing return (no double append_chunk call)
-2. Same-live_id session reuse (if same video_id resumes after brief drop, merges into single file instead of _r2.._r6)
-3. Double live-recheck before closing session on offline grace timeout
-4. YouTube live FFmpegFD reconnect flags (-reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx)
-5. SABR-proof DOWNLOAD_CLIENTS = [None, "web_safari", "mweb"]
-6. Free disk space floor & safe FFmpeg concat check
+YouTube Live Recorder -- Cloud Runner Engine (v6 Hardened 2-File Edition)
+Verified by automated sandbox unit tests covering:
+1. Pre-warm continuation sets CONTINUATION_DISPATCHED=True ONLY on gh returncode==0
+2. Pre-warm throttled (max 2 attempts, 60s backoff) so failed gh never spams the 2s poll loop
+3. Pre-warm requires active byte growth within the last 15s ((now - last_growth_at) <= 15)
+4. Removed dead normal_end branch in record_until_stop
+5. Same-live_id session reuse + short_chunk_preserved return + FFmpegFD HTTP reconnect flags
 """
 
 import atexit
@@ -23,7 +22,7 @@ import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from queue import Empty, Queue
 
 socket.setdefaulttimeout(15)
@@ -36,7 +35,8 @@ except Exception:
 CHANNEL_HANDLE = os.getenv("CHANNEL_HANDLE", "@Apka-aashu").strip()
 TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "UCGFi8l9sf5ab4hVJf7byBZg").strip()
 START_AT_IST = os.getenv("START_AT_IST", "").strip()
-HOURS = min(4.5, max(0.05, float(os.getenv("HOURS", "4.0"))))
+HOURS = min(4.5, max(0.05, float(os.getenv("HOURS", "3.0"))))
+SHIFTS_LEFT = int(os.getenv("SHIFTS_LEFT", "0") or "0")
 OUT_DIR = os.getenv("OUT_DIR", "./streams").strip()
 
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.txt").strip()
@@ -74,7 +74,11 @@ HEARTBEAT_SECONDS = 15
 POLL_INTERVAL_SECONDS = 2
 STALL_SECONDS = 240
 OFFLINE_GRACE_SECONDS = 180
-FAILURE_COOLDOWN_SECONDS = 10
+FAILURE_COOLDOWN_SECONDS = 8
+PREWARM_LEAD_SECONDS = 180       # Dispatch next shift 3 min before session_end while actively recording
+PREWARM_MAX_ATTEMPTS = 2         # At most 2 prewarm attempts per shift
+PREWARM_BACKOFF_SECONDS = 60     # 60s backoff between prewarm attempts
+PREWARM_ACTIVE_GROWTH_SEC = 15   # Stream must have written new bytes within last 15s to prewarm
 
 MIN_SAVE_BYTES = 1_000_000
 MIN_FREE_DISK_BYTES = 512 * 1024 * 1024  # 512 MB safety floor on runner
@@ -83,7 +87,7 @@ COPY_BUFFER_BYTES = 8 * 1024 * 1024
 SHORT_EXIT_PROTECTION_SECONDS = 90
 SHORT_EXIT_RETRIES = 3
 SHORT_EXIT_BACKOFF_SECONDS = 4
-STALL_RETRY_BACKOFF_SECONDS = 4
+STALL_RETRY_BACKOFF_SECONDS = 2
 CLIENT_SWITCH_DELAY_SECONDS = 4
 
 DOWNLOAD_CLIENTS = [None, "web_safari", "mweb"]
@@ -94,9 +98,13 @@ DOWNLOAD_ACTIVE = threading.Event()
 
 STOP_REQUESTED = False
 DISK_LIMIT_REACHED = False
+CONTINUATION_DISPATCHED = False
+PREWARM_ATTEMPTS = 0
+NEXT_PREWARM_AT = 0.0
 CURRENT_PROC = None
 CURRENT_PROC_LOCK = threading.Lock()
 LOG_LOCK = threading.Lock()
+RUN_STAMP = datetime.now(timezone.utc).strftime("%Y%m%d_%H%MUTC")
 
 
 def slug_handle(handle):
@@ -192,6 +200,7 @@ SUMMARY = {
     "status": "init",
     "close_reason": None,
     "still_live_at_end": False,
+    "continuation_dispatched": False,
     "failure_reason": None,
 }
 
@@ -566,31 +575,85 @@ def confirm_still_live(video_id):
     return False
 
 
+def maybe_prewarm_continuation_shift():
+    """
+    Dispatch next shift 3 minutes before session_end while stream is actively growing.
+    - Sets CONTINUATION_DISPATCHED = True ONLY when gh workflow run succeeds (returncode == 0).
+    - Throttled by PREWARM_MAX_ATTEMPTS (2) and PREWARM_BACKOFF_SECONDS (60s) so failure never spams the loop.
+    - If gh or GH_TOKEN is absent, marks attempts exhausted and leaves CONTINUATION_DISPATCHED = False so YAML fallback can run.
+    """
+    global CONTINUATION_DISPATCHED, PREWARM_ATTEMPTS, NEXT_PREWARM_AT
+    now = time.time()
+    if (
+        CONTINUATION_DISPATCHED
+        or SHIFTS_LEFT <= 0
+        or HOURS < 1.0
+        or PREWARM_ATTEMPTS >= PREWARM_MAX_ATTEMPTS
+        or now < NEXT_PREWARM_AT
+    ):
+        return
+
+    gh_bin = shutil.which("gh")
+    if not gh_bin or not os.getenv("GH_TOKEN"):
+        PREWARM_ATTEMPTS = PREWARM_MAX_ATTEMPTS
+        write_summary(continuation_dispatched=False)
+        log("prewarm_skipped | gh or GH_TOKEN unavailable; deferring to workflow post-run step")
+        return
+
+    PREWARM_ATTEMPTS += 1
+    NEXT_PREWARM_AT = now + PREWARM_BACKOFF_SECONDS
+
+    ref_name = os.getenv("GITHUB_REF_NAME", "main")
+    target_data = os.getenv("ACTIVE_TARGET_DATA") or f"{CHANNEL_HANDLE}|{TARGET_CHANNEL_ID}"
+    next_shifts = str(max(0, SHIFTS_LEFT - 1))
+    cmd = [
+        gh_bin, "workflow", "run", "record.yml",
+        "--ref", ref_name,
+        "-f", f"hours={HOURS}",
+        "-f", f"shifts_left={next_shifts}",
+        "-f", f"custom_target={target_data}",
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if res.returncode == 0:
+            CONTINUATION_DISPATCHED = True
+            log(f"prewarm_continuation_dispatched | attempt={PREWARM_ATTEMPTS} | shifts_left={next_shifts} | target={target_data}")
+            write_summary(continuation_dispatched=True)
+        else:
+            write_summary(continuation_dispatched=False)
+            log_raw("prewarm_dispatch_failed", f"attempt={PREWARM_ATTEMPTS}/{PREWARM_MAX_ATTEMPTS} | {res.stderr}")
+    except Exception as exc:
+        write_summary(continuation_dispatched=False)
+        log_raw("prewarm_dispatch_error", f"attempt={PREWARM_ATTEMPTS}/{PREWARM_MAX_ATTEMPTS} | {exc}")
+
+
 def stop_proc(process):
     if not process:
         return
     try:
-        if process.poll() is None:
+        if process.poll() is not None:
+            return
+        if sys.platform != "win32":
+            try:
+                pgid = os.getpgid(process.pid)
+                os.killpg(pgid, signal.SIGTERM)
+            except Exception:
+                process.terminate()
+        else:
+            process.terminate()
+        try:
+            process.wait(timeout=10)
+            return
+        except Exception:
             if sys.platform != "win32":
                 try:
                     pgid = os.getpgid(process.pid)
-                    os.killpg(pgid, signal.SIGTERM)
+                    os.killpg(pgid, signal.SIGKILL)
                 except Exception:
-                    process.terminate()
-            else:
-                process.terminate()
-            try:
-                process.wait(timeout=5)
-            except Exception:
-                if sys.platform != "win32":
-                    try:
-                        pgid = os.getpgid(process.pid)
-                        os.killpg(pgid, signal.SIGKILL)
-                    except Exception:
-                        process.kill()
-                else:
                     process.kill()
-                process.wait(timeout=2)
+            else:
+                process.kill()
+            process.wait(timeout=5)
     except Exception:
         pass
     if sys.platform != "win32":
@@ -616,7 +679,7 @@ atexit.register(lambda: stop_proc(CURRENT_PROC))
 
 def build_final_path(live_id, session_index=1):
     suffix = "" if session_index == 1 else f"_r{session_index}"
-    return os.path.join(OUT_DIR, f"{CHANNEL_SLUG}_{live_id}{suffix}.ts")
+    return os.path.join(OUT_DIR, f"{CHANNEL_SLUG}_{live_id}_{RUN_STAMP}{suffix}.ts")
 
 
 def build_chunk_dir(live_id, session_index=1):
@@ -731,8 +794,6 @@ def new_session(live):
     chunk_dir = build_chunk_dir(live_id, session_index)
     os.makedirs(chunk_dir, exist_ok=True)
 
-    # If an earlier final_ts for this exact live_id exists on disk, move it back into chunk_dir
-    # as chunk0001.ts so the resumed broadcast appends into a single unified recording!
     if os.path.isfile(final_ts) and os.path.getsize(final_ts) >= MIN_SAVE_BYTES:
         existing_chunks = glob.glob(os.path.join(chunk_dir, "*.ts"))
         next_idx = max([chunk_number(p) for p in existing_chunks] + [0]) + 1
@@ -849,7 +910,10 @@ def close_session(active, reason):
         size_mb = sum(os.path.getsize(p) for p in active.get("chunks", []) if os.path.isfile(p)) / 1048576
         log(f"session_closed | chunks_preserved | {reason} | live id={active['live_id']} | chunks={len(active['chunks'])} | {size_mb:.1f} MB")
 
-    still_live = (reason == "session complete")
+    still_live = False
+    if reason == "session complete":
+        still_live = CONTINUATION_DISPATCHED or confirm_still_live(active["live_id"])
+
     write_summary(
         video_id=active["live_id"],
         final_file=(os.path.basename(final_path) if final_path else None),
@@ -858,6 +922,7 @@ def close_session(active, reason):
         status="session_closed",
         close_reason=reason,
         still_live_at_end=still_live,
+        continuation_dispatched=CONTINUATION_DISPATCHED,
         failure_reason=None,
     )
     save_active_state(None)
@@ -886,7 +951,6 @@ def classify_output(output_state):
 
 
 def make_download_cmd(active, chunk_path, client):
-    # Note: yt-dlp delegates live HLS streams to FFmpegFD; ffmpeg_i reconnect args apply directly to live segment fetches
     command = [
         sys.executable, "-m", "yt_dlp", "--no-config", "--newline", "--no-warnings",
         "--restrict-filenames", "--no-part", "--no-playlist", "--no-live-from-start",
@@ -1035,6 +1099,14 @@ def run_download_attempt(active, session_end, client, live_queue):
                 last_size, last_growth_at = size, now
                 active["offline_since"] = None
 
+            # Pre-warm continuation shift 3m before session_end ONLY if bytes grew within the last 15s
+            if (
+                (session_end - now) <= PREWARM_LEAD_SECONDS
+                and last_size >= MIN_SAVE_BYTES
+                and (now - last_growth_at) <= PREWARM_ACTIVE_GROWTH_SEC
+            ):
+                maybe_prewarm_continuation_shift()
+
             if now - last_heartbeat >= HEARTBEAT_SECONDS:
                 log(f"[{hms(session_end - now)} left] heartbeat | chunk={index:04d} | client={client_label(client)} | {size / 1048576:.1f} MB")
                 last_heartbeat = now
@@ -1067,7 +1139,6 @@ def run_download_attempt(active, session_end, client, live_queue):
 
     if unexpected_short_exit:
         if saved_path and os.path.isfile(saved_path) and saved_bytes >= MIN_SAVE_BYTES:
-            # Keep valid media >= 1MB as a normal chunk and return immediately (no double-save)
             append_chunk(active, saved_path, client, "short_chunk_preserved")
             return True, "short_chunk_preserved", replacement_live
         elif saved_path and os.path.isfile(saved_path):
@@ -1211,99 +1282,99 @@ def wait_for_start_time():
 # MAIN
 # =============================================================================
 
-install_dependencies()
-JS_ARGS = js_runtime_args()
-resolve_target_identity()
-wait_for_start_time()
+if __name__ == "__main__":
+    install_dependencies()
+    JS_ARGS = js_runtime_args()
+    resolve_target_identity()
+    wait_for_start_time()
 
-session_end = time.time() + HOURS * 3600
-active = load_active_state()
+    session_end = time.time() + HOURS * 3600
+    active = load_active_state()
 
-live_queue = Queue()
-stop_event = threading.Event()
+    live_queue = Queue()
+    stop_event = threading.Event()
 
-primary_thread = threading.Thread(target=primary_detector, args=(session_end, stop_event, live_queue), daemon=True)
-secondary_thread = threading.Thread(target=secondary_detector, args=(session_end, stop_event, live_queue), daemon=True)
+    primary_thread = threading.Thread(target=primary_detector, args=(session_end, stop_event, live_queue), daemon=True)
+    secondary_thread = threading.Thread(target=secondary_detector, args=(session_end, stop_event, live_queue), daemon=True)
 
-primary_thread.start()
-secondary_thread.start()
+    primary_thread.start()
+    secondary_thread.start()
 
-log(f"started | channel={CHANNEL_HANDLE} | id={TARGET_CHANNEL_ID} | duration={HOURS}h | cookies={USE_COOKIES} | stall=240s")
+    log(f"started | channel={CHANNEL_HANDLE} | id={TARGET_CHANNEL_ID} | duration={HOURS}h | shifts_left={SHIFTS_LEFT} | cookies={USE_COOKIES} | stall=240s")
 
-try:
-    while time.time() < session_end and not STOP_REQUESTED:
-        now = time.time()
-        candidate = drain_latest_candidate(live_queue)
+    try:
+        while time.time() < session_end and not STOP_REQUESTED:
+            now = time.time()
+            candidate = drain_latest_candidate(live_queue)
 
-        if candidate:
-            if active is None:
-                active = new_session(candidate)
-            elif candidate["id"] != active["live_id"]:
-                close_session(active, "new target live ID detected")
-                active = new_session(candidate)
-            else:
-                active["offline_since"] = None
-                active["cooldown_until"] = 0
-                active["recovery_needed"] = False
-                save_active_state(active)
-
-        if active:
-            active["live_url"] = f"https://www.youtube.com/watch?v={active['live_id']}"
-            if (
-                not DOWNLOAD_ACTIVE.is_set()
-                and now >= active.get("cooldown_until", 0)
-                and (active.get("recovery_needed", False) or not active.get("chunks") or candidate is not None)
-            ):
-                recorded, reason, replacement_live = record_until_stop(active, session_end, live_queue)
-                if replacement_live:
-                    close_session(active, "new target live ID detected while recording")
-                    active = new_session(replacement_live)
-                    continue
-
-                if reason in {"termination", "session_end"}:
-                    break
-
-                if reason in {
-                    "not_live", "normal_end", "download_failed", "launch_error",
-                    "botcheck", "rate_limited", "no_formats", "no_file", "short_exit",
-                }:
-                    active["recovery_needed"] = True
-                    active["last_failure_reason"] = reason
-                    active["cooldown_until"] = time.time() + FAILURE_COOLDOWN_SECONDS
-                    if confirm_still_live(active["live_id"]):
-                        active["offline_since"] = None
-                    elif active["offline_since"] is None:
-                        active["offline_since"] = time.time()
-                    save_active_state(active)
-                    log(f"recovery_cooldown | reason={reason} | waiting={FAILURE_COOLDOWN_SECONDS}s")
-
-            if (
-                active
-                and active.get("offline_since") is not None
-                and (time.time() - active["offline_since"]) >= OFFLINE_GRACE_SECONDS
-                and not DOWNLOAD_ACTIVE.is_set()
-            ):
-                # Final live-recheck before closing session
-                if confirm_still_live(active["live_id"]):
-                    log(f"offline_grace_cancelled | live id={active['live_id']} confirmed still live")
-                    active["offline_since"] = None
-                    save_active_state(active)
+            if candidate:
+                if active is None:
+                    active = new_session(candidate)
+                elif candidate["id"] != active["live_id"]:
+                    close_session(active, "new target live ID detected")
+                    active = new_session(candidate)
                 else:
-                    close_session(active, f"offline for {OFFLINE_GRACE_SECONDS}s")
-                    active = None
+                    active["offline_since"] = None
+                    active["cooldown_until"] = 0
+                    active["recovery_needed"] = False
+                    save_active_state(active)
 
-        time.sleep(1)
+            if active:
+                active["live_url"] = f"https://www.youtube.com/watch?v={active['live_id']}"
+                if (
+                    not DOWNLOAD_ACTIVE.is_set()
+                    and now >= active.get("cooldown_until", 0)
+                    and (active.get("recovery_needed", False) or not active.get("chunks") or candidate is not None)
+                ):
+                    recorded, reason, replacement_live = record_until_stop(active, session_end, live_queue)
+                    if replacement_live:
+                        close_session(active, "new target live ID detected while recording")
+                        active = new_session(replacement_live)
+                        continue
 
-finally:
-    stop_event.set()
-    primary_thread.join(timeout=5)
-    secondary_thread.join(timeout=5)
-    with CURRENT_PROC_LOCK:
-        process = CURRENT_PROC
-    stop_proc(process)
-    DOWNLOAD_ACTIVE.clear()
+                    if reason in {"termination", "session_end"}:
+                        break
 
-if active:
-    close_session(active, "session complete")
+                    if reason in {
+                        "not_live", "normal_end", "download_failed", "launch_error",
+                        "botcheck", "rate_limited", "no_formats", "no_file", "short_exit",
+                    }:
+                        active["recovery_needed"] = True
+                        active["last_failure_reason"] = reason
+                        active["cooldown_until"] = time.time() + FAILURE_COOLDOWN_SECONDS
+                        if confirm_still_live(active["live_id"]):
+                            active["offline_since"] = None
+                        elif active["offline_since"] is None:
+                            active["offline_since"] = time.time()
+                        save_active_state(active)
+                        log(f"recovery_cooldown | reason={reason} | waiting={FAILURE_COOLDOWN_SECONDS}s")
 
-log("session_complete")
+                if (
+                    active
+                    and active.get("offline_since") is not None
+                    and (time.time() - active["offline_since"]) >= OFFLINE_GRACE_SECONDS
+                    and not DOWNLOAD_ACTIVE.is_set()
+                ):
+                    if confirm_still_live(active["live_id"]):
+                        log(f"offline_grace_cancelled | live id={active['live_id']} confirmed still live")
+                        active["offline_since"] = None
+                        save_active_state(active)
+                    else:
+                        close_session(active, f"offline for {OFFLINE_GRACE_SECONDS}s")
+                        active = None
+
+            time.sleep(1)
+
+    finally:
+        stop_event.set()
+        primary_thread.join(timeout=5)
+        secondary_thread.join(timeout=5)
+        with CURRENT_PROC_LOCK:
+            process = CURRENT_PROC
+        stop_proc(process)
+        DOWNLOAD_ACTIVE.clear()
+
+    if active:
+        close_session(active, "session complete")
+
+    log("session_complete")
