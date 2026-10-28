@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       hours:
-        description: "Recording duration per shift in hours (default 3.0; use 0.2 for a 12-min test)"
+        description: "Recording duration per shift in hours (default 2.0; use 0.2 for a 12-min test)"
         required: false
-        default: "3.0"
+        default: "4.5"
         type: string
       shifts_left:
-        description: "Continuation shifts if still live at 3h cap (default 1 = up to 8h total; auto-disabled if hours < 1.0)"
+        description: "Continuation shifts if still live at 2h cap (default 1 = up to 8h total; auto-disabled if hours < 1.0)"
         required: false
         default: "1"
         type: string
@@ -31,7 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - "@NocturnalFlow|UC0sMIGh-PITFxP_BAa_qcNw"
+          - "@GOREDOXLIVE|UC8MRu8goXUOM-_YaGsUvsmQ"
 
     steps:
       - name: Checkout Repository
@@ -51,7 +51,7 @@ jobs:
         env:
           TARGET_DATA: ${{ matrix.target }}
           CUSTOM_TARGET: ${{ github.event.inputs.custom_target }}
-          INPUT_HOURS: ${{ github.event.inputs.hours || '3.0' }}
+          INPUT_HOURS: ${{ github.event.inputs.hours || '4.5' }}
           INPUT_SHIFTS_LEFT: ${{ github.event.inputs.shifts_left || '1' }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -72,7 +72,7 @@ jobs:
 
           export CHANNEL_HANDLE=$(echo "$TARGET_DATA" | cut -d'|' -f1)
           export TARGET_CHANNEL_ID=$(echo "$TARGET_DATA" | cut -d'|' -f2)
-          export HOURS="${INPUT_HOURS:-3.0}"
+          export HOURS="${INPUT_HOURS:-4.5}"
           export OUT_DIR="./streams"
 
           # Disable auto-continuation on short tests (< 1.0 hour) so a 12-min @DWNews test doesn't spawn another run

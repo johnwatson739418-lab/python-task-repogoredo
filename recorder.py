@@ -35,7 +35,7 @@ except Exception:
 CHANNEL_HANDLE = os.getenv("CHANNEL_HANDLE", "@Apka-aashu").strip()
 TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "UCGFi8l9sf5ab4hVJf7byBZg").strip()
 START_AT_IST = os.getenv("START_AT_IST", "").strip()
-HOURS = min(4.5, max(0.05, float(os.getenv("HOURS", "3.0"))))
+HOURS = min(4.5, max(0.05, float(os.getenv("HOURS", "2.0"))))
 SHIFTS_LEFT = int(os.getenv("SHIFTS_LEFT", "0") or "0")
 OUT_DIR = os.getenv("OUT_DIR", "./streams").strip()
 
@@ -183,7 +183,7 @@ def normalize_message(value):
 BOTCHECK_MARKERS = ["sign in to confirm you're not a bot", "confirm you're not a bot"]
 NO_FORMAT_MARKERS = ["no video formats found", "requested format is not available"]
 RATE_LIMIT_MARKERS = ["http error 403", "http error 429", "try again later", "too many requests"]
-NOT_LIVE_MARKERS = ["the channel is not currently live", "this live event will begin", "this live event has ended"]
+NOT_LIVE_MARKERS = ["the channel is not currently live", "this live event will begin", "this live event has ended", "does not pass filter"]
 NORMAL_END_MARKERS = ["finished downloading", "download complete", "has already been downloaded"]
 
 
@@ -564,7 +564,12 @@ def probe_secondary():
 
 
 def confirm_still_live(video_id):
-    """Double-check via both primary and secondary probes before declaring a stream offline."""
+    """Fast direct check on known video_id first (~2s), falling back to channel probes if needed."""
+    try:
+        if video_id and validate_candidate(video_id, None):
+            return True
+    except Exception:
+        pass
     for probe_fn in (probe_fast, probe_secondary):
         try:
             res = probe_fn()
@@ -953,7 +958,7 @@ def classify_output(output_state):
 def make_download_cmd(active, chunk_path, client):
     command = [
         sys.executable, "-m", "yt_dlp", "--no-config", "--newline", "--no-warnings",
-        "--restrict-filenames", "--no-part", "--no-playlist", "--no-live-from-start",
+        "--restrict-filenames", "--no-part", "--no-playlist", "--no-live-from-start", "--match-filter", "is_live",
         "--fixup", "never",
         "--downloader-args", "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 10",
         "--print", "before_dl:chosen=%(format_id)s | %(resolution)s | tbr=%(tbr)s | protocol=%(protocol)s",
