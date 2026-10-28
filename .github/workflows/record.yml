@@ -4,15 +4,24 @@ on:
   workflow_dispatch:
     inputs:
       hours:
-        description: "Recording duration in hours (default 4.0 for safe upload buffer; use 0.2 for a 12-min test)"
+        description: "Recording duration per shift in hours (default 4.0; use 0.2 for a 12-min test)"
         required: false
         default: "4.0"
+        type: string
+      shifts_left:
+        description: "Auto-restart shifts if streamer is still live at 4h cap (default 1 = up to 8h total)"
+        required: false
+        default: "1"
         type: string
       custom_target:
         description: "Optional single channel override (e.g. @DWNews| or @prankurv123|UCYe2VVWgjUoEEn9LaLSCk9w). Leave empty for full matrix."
         required: false
         default: ""
         type: string
+
+permissions:
+  contents: write
+  actions: write
 
 jobs:
   record:
@@ -43,7 +52,9 @@ jobs:
           TARGET_DATA: ${{ matrix.target }}
           CUSTOM_TARGET: ${{ github.event.inputs.custom_target }}
           INPUT_HOURS: ${{ github.event.inputs.hours || '4.0' }}
+          SHIFTS_LEFT: ${{ github.event.inputs.shifts_left || '1' }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ -n "$CUSTOM_TARGET" ]; then
             TARGET_DATA="$CUSTOM_TARGET"
@@ -64,7 +75,30 @@ jobs:
           export OUT_DIR="./streams"
 
           echo "CHANNEL_HANDLE=$CHANNEL_HANDLE" >> "$GITHUB_ENV"
+          echo "ACTIVE_TARGET_DATA=$TARGET_DATA" >> "$GITHUB_ENV"
           python3 recorder.py
+
+          # Auto-restart continuation shift IMMEDIATELY (before upload) if streamer was still live at 4h cap
+          STILL_LIVE=$(python3 - <<'PY'
+          import glob, json
+          for p in glob.glob("./streams/*_summary.json"):
+              try:
+                  d = json.loads(open(p, encoding="utf-8").read())
+                  if d.get("still_live_at_end"):
+                      print("true")
+                      break
+              except Exception:
+                  pass
+          PY
+          )
+          if [ "$STILL_LIVE" == "true" ] && [ "${SHIFTS_LEFT:-0}" -gt 0 ] 2>/dev/null; then
+            NEXT_SHIFTS=$((SHIFTS_LEFT - 1))
+            echo "Streamer $CHANNEL_HANDLE is still live at shift end -> dispatching continuation shift (shifts_left=$NEXT_SHIFTS)..."
+            gh workflow run record.yml --ref "${GITHUB_REF_NAME}" \
+              -f hours="${HOURS}" \
+              -f shifts_left="${NEXT_SHIFTS}" \
+              -f custom_target="${TARGET_DATA}" || true
+          fi
 
       - name: Auto-Upload to Gofile (Fallback to Google Drive)
         if: always()
@@ -74,6 +108,10 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          if [ -z "${CHANNEL_HANDLE:-}" ]; then
+            exit 0
+          fi
+
           # 1. Stop any lingering downloader/encoder processes and flush file buffers
           pkill -9 -f ffmpeg 2>/dev/null || true
           pkill -9 -f yt-dlp 2>/dev/null || true
@@ -85,7 +123,6 @@ jobs:
           mkdir -p ./streams
 
           # Collect all valid media files > 1MB (both merged top-level files and any unmerged _chunks)
-          # Because recorder.py deletes chunks after a successful FFmpeg concat, any chunk still in _chunks is unmerged and unique.
           mapfile -t FILES < <(find ./streams -type f \( -name "*.ts" -o -name "*.part" -o -name "*.mp4" \) ! -name "*_short_exit_*" -size +1M | sort)
 
           if [ "${#FILES[@]}" -eq 0 ]; then
@@ -94,7 +131,7 @@ jobs:
             exit 0
           fi
 
-          # Prepare rclone config and validate a section with type = drive
+          # Prepare rclone config and strictly validate a section with type = drive
           RCLONE_CONF=""
           DRIVE_REMOTE=""
           if [ -n "$RCLONE_CONFIG_SECRET" ]; then
@@ -115,9 +152,6 @@ jobs:
                   if cp.get(sec, "type", fallback="").strip().lower() == "drive":
                       print(sec)
                       break
-              else:
-                  if cp.sections():
-                      print(cp.sections()[0])
           except Exception:
               pass
           PY
@@ -140,7 +174,10 @@ jobs:
               AUTH_ARGS=(-H "Authorization: Bearer $GOFILE_TOKEN")
             fi
 
-            RESP=$(curl -s --connect-timeout 20 --max-time 900 "${AUTH_ARGS[@]}" -X POST "https://upload.gofile.io/uploadfile" -F "file=@$f" || true)
+            # 40-min max ceiling for 5GB+ files, but fast 45s abort if transfer stalls < 500 KB/s
+            CURL_SPEED_ARGS=(--connect-timeout 20 --max-time 2400 --speed-limit 500000 --speed-time 45)
+
+            RESP=$(curl -s "${CURL_SPEED_ARGS[@]}" "${AUTH_ARGS[@]}" -X POST "https://upload.gofile.io/uploadfile" -F "file=@$f" || true)
             STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null || true)
 
             # Secondary Gofile server lookup if global endpoint didn't return ok
@@ -148,7 +185,7 @@ jobs:
               SERVER=$(curl -s --max-time 15 "https://api.gofile.io/servers" | jq -r '.data.servers[0].name // empty' 2>/dev/null || true)
               if [ -n "$SERVER" ]; then
                 echo "Retrying Gofile via server ${SERVER}.gofile.io..."
-                RESP=$(curl -s --connect-timeout 20 --max-time 900 "${AUTH_ARGS[@]}" -X POST "https://${SERVER}.gofile.io/uploadFile" -F "file=@$f" || true)
+                RESP=$(curl -s "${CURL_SPEED_ARGS[@]}" "${AUTH_ARGS[@]}" -X POST "https://${SERVER}.gofile.io/uploadFile" -F "file=@$f" || true)
                 STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null || true)
               fi
             fi
@@ -164,7 +201,7 @@ jobs:
             else
               echo "Gofile upload failed ($RESP). Falling back to Google Drive..."
 
-              # 2) Fallback to Google Drive via rclone (verified type = drive remote)
+              # 2) Fallback to Google Drive via rclone (strictly verified type = drive remote)
               if [ -n "$RCLONE_CONF" ] && [ -n "$DRIVE_REMOTE" ]; then
                 CLEAN_CH="${CHANNEL_HANDLE#@}"
                 DATE_DIR=$(date -u +"%Y-%m-%d")
@@ -188,7 +225,7 @@ jobs:
                   echo "ERROR: Google Drive fallback upload also failed for $FNAME"
                 fi
               else
-                echo "ERROR: Gofile failed and no valid Google Drive remote found in RCLONE_CONFIG!"
+                echo "ERROR: Gofile failed and no valid (type = drive) Google Drive remote found in RCLONE_CONFIG!"
               fi
             fi
 

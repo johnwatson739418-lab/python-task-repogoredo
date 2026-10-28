@@ -1,9 +1,12 @@
 """
-YouTube Live Recorder -- Cloud Runner Engine (Final Hardened 2-File Edition)
-Based on proven sucessgithub.txt with:
-- Free disk space monitoring (stops cleanly before runner 14GB disk fills up)
-- Safe FFmpeg concat check (skips concat & preserves raw chunks if free disk < chunk sum)
-- Default + Android + Web_Safari + HTML badge + RSS multi-detector
+YouTube Live Recorder -- Cloud Runner Engine (v4 Hardened 2-File Edition)
+Incorporates all verified fixes from live runs + Claude & ChatGPT audits:
+1. Fixed short_chunk_preserved missing return (no double append_chunk call)
+2. Same-live_id session reuse (if same video_id resumes after brief drop, merges into single file instead of _r2.._r6)
+3. Double live-recheck before closing session on offline grace timeout
+4. YouTube live FFmpegFD reconnect flags (-reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx)
+5. SABR-proof DOWNLOAD_CLIENTS = [None, "web_safari", "mweb"]
+6. Free disk space floor & safe FFmpeg concat check
 """
 
 import atexit
@@ -71,20 +74,20 @@ HEARTBEAT_SECONDS = 15
 POLL_INTERVAL_SECONDS = 2
 STALL_SECONDS = 240
 OFFLINE_GRACE_SECONDS = 180
-FAILURE_COOLDOWN_SECONDS = 15
+FAILURE_COOLDOWN_SECONDS = 10
 
 MIN_SAVE_BYTES = 1_000_000
 MIN_FREE_DISK_BYTES = 512 * 1024 * 1024  # 512 MB safety floor on runner
 COPY_BUFFER_BYTES = 8 * 1024 * 1024
 
 SHORT_EXIT_PROTECTION_SECONDS = 90
-SHORT_EXIT_RETRIES = 2
+SHORT_EXIT_RETRIES = 3
 SHORT_EXIT_BACKOFF_SECONDS = 4
 STALL_RETRY_BACKOFF_SECONDS = 4
-CLIENT_SWITCH_DELAY_SECONDS = 5
+CLIENT_SWITCH_DELAY_SECONDS = 4
 
-DOWNLOAD_CLIENTS = ["android", None]
-VALIDATION_CLIENTS = ["android", "web_safari", None]
+DOWNLOAD_CLIENTS = [None, "web_safari", "mweb"]
+VALIDATION_CLIENTS = [None, "web_safari", "android"]
 
 SESSION_ACTIVE = threading.Event()
 DOWNLOAD_ACTIVE = threading.Event()
@@ -187,6 +190,8 @@ SUMMARY = {
     "final_size_mb": 0.0,
     "chunk_count": 0,
     "status": "init",
+    "close_reason": None,
+    "still_live_at_end": False,
     "failure_reason": None,
 }
 
@@ -469,8 +474,8 @@ def probe_fast():
     futures = {
         executor.submit(fetch_text, CHANNEL_URL): "home",
         executor.submit(run_ytdlp_json, LIVE_URL, None): "default_live",
-        executor.submit(run_ytdlp_json, LIVE_URL, "android"): "android_live",
         executor.submit(run_ytdlp_json, LIVE_URL, "web_safari"): "web_live",
+        executor.submit(run_ytdlp_json, LIVE_URL, "android"): "android_live",
     }
     home_html = ""
     live_infos = {}
@@ -491,7 +496,7 @@ def probe_fast():
     finally:
         executor.shutdown(wait=False)
 
-    for key, client in (("default_live", None), ("android_live", "android"), ("web_live", "web_safari")):
+    for key, client in (("default_live", None), ("web_live", "web_safari"), ("android_live", "android")):
         info = live_infos.get(key)
         if not info or not is_live_candidate(info):
             continue
@@ -549,6 +554,18 @@ def probe_secondary():
     return None
 
 
+def confirm_still_live(video_id):
+    """Double-check via both primary and secondary probes before declaring a stream offline."""
+    for probe_fn in (probe_fast, probe_secondary):
+        try:
+            res = probe_fn()
+            if res and res.get("id") == video_id:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def stop_proc(process):
     if not process:
         return
@@ -597,12 +614,12 @@ signal.signal(signal.SIGINT, sigterm_handler)
 atexit.register(lambda: stop_proc(CURRENT_PROC))
 
 
-def build_final_path(live_id, session_index):
+def build_final_path(live_id, session_index=1):
     suffix = "" if session_index == 1 else f"_r{session_index}"
     return os.path.join(OUT_DIR, f"{CHANNEL_SLUG}_{live_id}{suffix}.ts")
 
 
-def build_chunk_dir(live_id, session_index):
+def build_chunk_dir(live_id, session_index=1):
     return os.path.join(CHUNKS_DIR, f"{CHANNEL_SLUG}_{live_id}_r{session_index}")
 
 
@@ -687,7 +704,7 @@ def load_active_state():
         required = {"live_id", "session_index", "chunk_index", "final_ts", "chunk_dir", "chunks"}
         if not required.issubset(active):
             raise ValueError("missing required state fields")
-        active.setdefault("preferred_client", "android")
+        active["preferred_client"] = None
         active.setdefault("client_locked", False)
         active.setdefault("short_exit_streak", 0)
         active.setdefault("short_exit_seq", 0)
@@ -707,22 +724,36 @@ def load_active_state():
 
 
 def new_session(live):
+    """Open or reuse session for live_id so same broadcast never splits into _r2.._r6."""
     live_id = live["id"]
     session_index = 1
-    while os.path.exists(build_final_path(live_id, session_index)) or os.path.isdir(build_chunk_dir(live_id, session_index)):
-        session_index += 1
+    final_ts = build_final_path(live_id, session_index)
+    chunk_dir = build_chunk_dir(live_id, session_index)
+    os.makedirs(chunk_dir, exist_ok=True)
+
+    # If an earlier final_ts for this exact live_id exists on disk, move it back into chunk_dir
+    # as chunk0001.ts so the resumed broadcast appends into a single unified recording!
+    if os.path.isfile(final_ts) and os.path.getsize(final_ts) >= MIN_SAVE_BYTES:
+        existing_chunks = glob.glob(os.path.join(chunk_dir, "*.ts"))
+        next_idx = max([chunk_number(p) for p in existing_chunks] + [0]) + 1
+        restored_chunk = os.path.join(chunk_dir, f"{CHANNEL_SLUG}_{live_id}_r{session_index}_chunk{next_idx:04d}.ts")
+        try:
+            os.replace(final_ts, restored_chunk)
+            log(f"session_reused | moved prior {os.path.basename(final_ts)} -> {os.path.basename(restored_chunk)} to prevent _r2 split")
+        except Exception as exc:
+            log_raw("session_reuse_error", exc)
 
     active = {
         "live_id": live_id,
         "live_url": f"https://www.youtube.com/watch?v={live_id}",
-        "preferred_client": "android",
+        "preferred_client": None,
         "client_locked": False,
         "short_exit_streak": 0,
         "short_exit_seq": 0,
         "session_index": session_index,
         "chunk_index": 1,
-        "final_ts": build_final_path(live_id, session_index),
-        "chunk_dir": build_chunk_dir(live_id, session_index),
+        "final_ts": final_ts,
+        "chunk_dir": chunk_dir,
         "chunks": [],
         "recording_path": None,
         "offline_since": None,
@@ -730,11 +761,11 @@ def new_session(live):
         "last_failure_reason": None,
         "recovery_needed": False,
     }
-    os.makedirs(active["chunk_dir"], exist_ok=True)
+    register_recovered_chunks(active)
     save_active_state(active)
     SESSION_ACTIVE.set()
     write_summary(video_id=live_id, detect_source=live.get("source"), status="session_open")
-    log(f"opened_session | live id={live_id} | source={live.get('source')} | output={os.path.basename(active['final_ts'])}")
+    log(f"opened_session | live id={live_id} | source={live.get('source')} | prior_chunks={len(active['chunks'])} | output={os.path.basename(active['final_ts'])}")
     return active
 
 
@@ -772,7 +803,6 @@ def build_final_file(active):
                 return None
         return final_path if os.path.isfile(final_path) and os.path.getsize(final_path) >= MIN_SAVE_BYTES else None
 
-    # Check if there is enough free disk space to safely concat multiple chunks
     total_chunk_bytes = sum(os.path.getsize(p) for p in chunks if os.path.isfile(p))
     free_bytes = shutil.disk_usage(OUT_DIR).free
     if free_bytes < total_chunk_bytes + 256 * 1024 * 1024:
@@ -819,9 +849,16 @@ def close_session(active, reason):
         size_mb = sum(os.path.getsize(p) for p in active.get("chunks", []) if os.path.isfile(p)) / 1048576
         log(f"session_closed | chunks_preserved | {reason} | live id={active['live_id']} | chunks={len(active['chunks'])} | {size_mb:.1f} MB")
 
+    still_live = (reason == "session complete")
     write_summary(
-        video_id=active["live_id"], final_file=(os.path.basename(final_path) if final_path else None),
-        final_size_mb=round(size_mb, 1), chunk_count=len(active["chunks"]), status="session_closed", failure_reason=None,
+        video_id=active["live_id"],
+        final_file=(os.path.basename(final_path) if final_path else None),
+        final_size_mb=round(size_mb, 1),
+        chunk_count=len(active["chunks"]),
+        status="session_closed",
+        close_reason=reason,
+        still_live_at_end=still_live,
+        failure_reason=None,
     )
     save_active_state(None)
 
@@ -849,9 +886,12 @@ def classify_output(output_state):
 
 
 def make_download_cmd(active, chunk_path, client):
+    # Note: yt-dlp delegates live HLS streams to FFmpegFD; ffmpeg_i reconnect args apply directly to live segment fetches
     command = [
         sys.executable, "-m", "yt_dlp", "--no-config", "--newline", "--no-warnings",
         "--restrict-filenames", "--no-part", "--no-playlist", "--no-live-from-start",
+        "--fixup", "never",
+        "--downloader-args", "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 10",
         "--print", "before_dl:chosen=%(format_id)s | %(resolution)s | tbr=%(tbr)s | protocol=%(protocol)s",
         "--retries", "20", "--extractor-retries", "20", "--file-access-retries", "20",
         "--fragment-retries", "infinite", "--retry-sleep", "http:2", "--retry-sleep", "fragment:1",
@@ -947,16 +987,7 @@ def run_download_attempt(active, session_end, client, live_queue):
     log(f"[{hms(left)} left] download_started | chunk={index:04d} | client={client_label(client)}")
 
     try:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            start_new_session=(sys.platform != "win32"),
-        )
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, start_new_session=(sys.platform != "win32"))
     except Exception as exc:
         log_raw("download_launch_error", exc)
         active["recording_path"] = None
@@ -1002,6 +1033,7 @@ def run_download_attempt(active, session_end, client, live_queue):
             size = os.path.getsize(path) if path else 0
             if size > last_size:
                 last_size, last_growth_at = size, now
+                active["offline_since"] = None
 
             if now - last_heartbeat >= HEARTBEAT_SECONDS:
                 log(f"[{hms(session_end - now)} left] heartbeat | chunk={index:04d} | client={client_label(client)} | {size / 1048576:.1f} MB")
@@ -1034,18 +1066,23 @@ def run_download_attempt(active, session_end, client, live_queue):
     )
 
     if unexpected_short_exit:
-        if saved_path and os.path.isfile(saved_path):
+        if saved_path and os.path.isfile(saved_path) and saved_bytes >= MIN_SAVE_BYTES:
+            # Keep valid media >= 1MB as a normal chunk and return immediately (no double-save)
+            append_chunk(active, saved_path, client, "short_chunk_preserved")
+            return True, "short_chunk_preserved", replacement_live
+        elif saved_path and os.path.isfile(saved_path):
             archived = archive_short_exit(active, saved_path)
             active["short_exit_streak"] = int(active.get("short_exit_streak", 0)) + 1
             active["recording_path"] = None
             save_active_state(active)
             log(f"short_exit_detected | client={client_label(client)} | duration={duration:.1f}s | size={saved_bytes / 1048576:.1f}MB | archived={os.path.basename(archived) if archived else 'none'}")
+            return False, "short_exit", replacement_live
         else:
             active["short_exit_streak"] = int(active.get("short_exit_streak", 0)) + 1
             active["recording_path"] = None
             save_active_state(active)
             log(f"short_exit_detected | client={client_label(client)} | duration={duration:.1f}s | size=0.0MB | archived=none")
-        return False, "short_exit", replacement_live
+            return False, "short_exit", replacement_live
 
     if saved_path and os.path.isfile(saved_path) and saved_bytes >= MIN_SAVE_BYTES:
         if STOP_REQUESTED: reason = "termination"
@@ -1081,7 +1118,7 @@ def record_until_stop(active, session_end, live_queue):
 
     last_reason = "download_failed"
     for client in clients:
-        short_attempts = int(active.get("short_exit_streak", 0)) if client == active.get("preferred_client") else 0
+        short_attempts = 0
         while time.time() < session_end and not STOP_REQUESTED:
             ok, reason, replacement_live = run_download_attempt(active, session_end, client, live_queue)
             if replacement_live: return False, "new_live_id", replacement_live
@@ -1099,10 +1136,9 @@ def record_until_stop(active, session_end, live_queue):
                 log(f"short_exit_limit_reached | client={client_label(client)} | moving to next client")
                 break
 
-            if ok and reason in {"stalled", "downloader_exit"}:
+            if ok and reason in {"stalled", "downloader_exit", "short_chunk_preserved"}:
                 short_attempts = 0
-                if reason == "stalled":
-                    time.sleep(STALL_RETRY_BACKOFF_SECONDS)
+                time.sleep(STALL_RETRY_BACKOFF_SECONDS)
                 continue
             break
 
@@ -1234,11 +1270,12 @@ try:
                     active["recovery_needed"] = True
                     active["last_failure_reason"] = reason
                     active["cooldown_until"] = time.time() + FAILURE_COOLDOWN_SECONDS
+                    if confirm_still_live(active["live_id"]):
+                        active["offline_since"] = None
+                    elif active["offline_since"] is None:
+                        active["offline_since"] = time.time()
                     save_active_state(active)
                     log(f"recovery_cooldown | reason={reason} | waiting={FAILURE_COOLDOWN_SECONDS}s")
-                    if active["offline_since"] is None:
-                        active["offline_since"] = time.time()
-                        save_active_state(active)
 
             if (
                 active
@@ -1246,8 +1283,14 @@ try:
                 and (time.time() - active["offline_since"]) >= OFFLINE_GRACE_SECONDS
                 and not DOWNLOAD_ACTIVE.is_set()
             ):
-                close_session(active, f"offline for {OFFLINE_GRACE_SECONDS}s")
-                active = None
+                # Final live-recheck before closing session
+                if confirm_still_live(active["live_id"]):
+                    log(f"offline_grace_cancelled | live id={active['live_id']} confirmed still live")
+                    active["offline_since"] = None
+                    save_active_state(active)
+                else:
+                    close_session(active, f"offline for {OFFLINE_GRACE_SECONDS}s")
+                    active = None
 
         time.sleep(1)
 
