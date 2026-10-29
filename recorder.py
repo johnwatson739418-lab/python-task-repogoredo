@@ -638,20 +638,72 @@ def maybe_prewarm_continuation_shift():
 
 
 def stop_proc(process):
-    if not process:
+    """Stop a downloader and its children in its dedicated POSIX process group."""
+    if process is None:
         return
-    try:
+
+    if os.name != "posix":
         if process.poll() is not None:
             return
-        process.terminate()
-        process.wait(timeout=10)
-        return
-    except Exception:
         try:
+            process.terminate()
+            process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
             process.kill()
-            process.wait(timeout=5)
-        except Exception:
+            process.wait(timeout=3)
+        except OSError as exc:
+            log_raw("process_stop_error", exc)
+        return
+
+    # Valid because the downloader was launched with start_new_session=True.
+    pgid = process.pid
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        log_raw("process_group_sigterm_error", exc)
+
+    try:
+        process.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError as exc:
+        log_raw("process_wait_error", exc)
+
+    # Wait briefly for child processes even when the group leader has exited.
+    deadline = time.monotonic() + 2.0
+    group_gone = False
+
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            group_gone = True
+            break
+        except PermissionError:
+            break
+        except OSError as exc:
+            log_raw("process_group_check_error", exc)
+            break
+
+        time.sleep(0.1)
+
+    if not group_gone:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
             pass
+        except OSError as exc:
+            log_raw("process_group_sigkill_error", exc)
+
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError as exc:
+        log_raw("process_wait_error", exc)
 
 
 def sigterm_handler(signum, frame):
@@ -1044,7 +1096,16 @@ def run_download_attempt(active, session_end, client, live_queue):
     log(f"[{hms(left)} left] download_started | chunk={index:04d} | client={client_label(client)}")
 
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            start_new_session=True,
+        )
     except Exception as exc:
         log_raw("download_launch_error", exc)
         active["recording_path"] = None
@@ -1110,8 +1171,8 @@ def run_download_attempt(active, session_end, client, live_queue):
                 stop_proc(process)
                 break
     finally:
-        if process.poll() is None:
-            stop_proc(process)
+        # Clean up the dedicated group even if the yt-dlp parent exited first.
+        stop_proc(process)
         with CURRENT_PROC_LOCK:
             CURRENT_PROC = None
         DOWNLOAD_ACTIVE.clear()

@@ -198,9 +198,58 @@ jobs:
           # Total Gofile time budget across all files = 1800s (30 min), leaving ~50-80 min for Drive fallback
           GOFILE_DEADLINE=$(( $(date +%s) + 1800 ))
           RUN_UTC_TAG=$(date -u +"%Y%m%d_%H%MUTC")
+          UPLOAD_FAILED=0
 
           for f in "${FILES[@]}"; do
             FNAME=$(basename "$f")
+
+            # Require three consecutive identical size-and-mtime samples.
+            stable_count=0
+            previous_signature=""
+
+            for attempt in 1 2 3 4 5; do
+              if [ ! -f "$f" ]; then
+                break
+              fi
+
+              signature=$(stat -c '%s:%y' -- "$f" 2>/dev/null) || break
+              size=${signature%%:*}
+
+              if ! [[ "$size" =~ ^[0-9]+$ ]] || [ "$size" -le 1048576 ]; then
+                stable_count=0
+                previous_signature="$signature"
+                if [ "$attempt" -lt 5 ]; then
+                  sleep 2
+                fi
+                continue
+              fi
+
+              if [ -n "$previous_signature" ] && [ "$signature" = "$previous_signature" ]; then
+                stable_count=$((stable_count + 1))
+              else
+                stable_count=0
+              fi
+
+              if [ "$stable_count" -ge 2 ]; then
+                break
+              fi
+
+              previous_signature="$signature"
+
+              if [ "$attempt" -lt 5 ]; then
+                sleep 2
+              fi
+            done
+
+            if [ "$stable_count" -lt 2 ]; then
+              echo "ERROR: Source file is missing or still changing: $f"
+              echo "- ❌ **$FNAME**: File did not stabilize; upload skipped." >> "$GITHUB_STEP_SUMMARY"
+              UPLOAD_FAILED=1
+              continue
+            fi
+
+            echo "Source stability check passed: $FNAME"
+
             FSIZE_MB=$(du -m "$f" | cut -f1)
             UPLOAD_LINK=""
             UPLOAD_METHOD=""
@@ -239,6 +288,9 @@ jobs:
 
             if [ "$STATUS" == "ok" ]; then
               UPLOAD_LINK=$(echo "$RESP" | jq -r '.data.downloadPage // empty' 2>/dev/null || true)
+            fi
+
+            if [ "$STATUS" == "ok" ] && [ -n "$UPLOAD_LINK" ]; then
               UPLOAD_METHOD="Gofile"
               echo "=================================================="
               echo "GOFILE UPLOAD SUCCESSFUL!"
@@ -290,5 +342,11 @@ jobs:
               fi
             else
               echo "- ❌ **$FNAME** (${FSIZE_MB} MB): Both Gofile and Google Drive uploads failed." >> "$GITHUB_STEP_SUMMARY"
+              UPLOAD_FAILED=1
             fi
           done
+
+          if [ "$UPLOAD_FAILED" -ne 0 ]; then
+            echo "At least one recording failed its stability check or upload."
+            exit 1
+          fi
