@@ -4,14 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       hours:
-        description: "Recording duration per shift in hours (default 2.0; use 0.2 for a 12-min test)"
+        description: "Recording duration per shift in hours (default 4.0; use 0.2 for a 12-min test)"
         required: false
-        default: "4.5"
+        default: "1.0"
         type: string
       shifts_left:
-        description: "Continuation shifts if still live at 2h cap (default 1 = up to 8h total; auto-disabled if hours < 1.0)"
+        description: "Continuation shifts after this one (default 1 = up to 2 shifts / ~8h total; auto-disabled if hours < 1.0)"
         required: false
         default: "1"
+        type: string
+      always_continue:
+        description: "true = start the next shift even if the streamer is offline at shift end. false = chain only if live."
+        required: false
+        default: "true"
         type: string
       custom_target:
         description: "Optional single channel override (e.g. @DWNews| or @prankurv123|UCYe2VVWgjUoEEn9LaLSCk9w). Leave empty for full matrix."
@@ -20,18 +25,43 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
   actions: write
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      targets: ${{ steps.resolve.outputs.targets }}
+    steps:
+      - name: Build target list (1 job if custom_target is set, else full matrix)
+        id: resolve
+        env:
+          CUSTOM_TARGET: ${{ github.event.inputs.custom_target }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          custom = os.environ.get("CUSTOM_TARGET", "").strip()
+          if custom:
+              targets = [custom]
+          else:
+              targets = [
+                  "@papercat_lofi|UCt6Dd-TapogoAXtp0G-svGw",
+              ]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("targets=" + json.dumps(targets) + "\n")
+          print("Resolved targets:", targets)
+          PY
+
   record:
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - "@GOREDOXLIVE|UC8MRu8goXUOM-_YaGsUvsmQ"
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
 
     steps:
       - name: Checkout Repository
@@ -50,17 +80,13 @@ jobs:
       - name: Run Recorder
         env:
           TARGET_DATA: ${{ matrix.target }}
-          CUSTOM_TARGET: ${{ github.event.inputs.custom_target }}
-          INPUT_HOURS: ${{ github.event.inputs.hours || '4.5' }}
+          INPUT_HOURS: ${{ github.event.inputs.hours || '4.0' }}
           INPUT_SHIFTS_LEFT: ${{ github.event.inputs.shifts_left || '1' }}
+          INPUT_ALWAYS_CONTINUE: ${{ github.event.inputs.always_continue || 'true' }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ -n "$CUSTOM_TARGET" ]; then
-            TARGET_DATA="$CUSTOM_TARGET"
-          fi
-
           if [ -n "$YT_COOKIES" ]; then
             printf "%s\n" "$YT_COOKIES" > cookies.txt
             export USE_COOKIES="true"
@@ -72,38 +98,49 @@ jobs:
 
           export CHANNEL_HANDLE=$(echo "$TARGET_DATA" | cut -d'|' -f1)
           export TARGET_CHANNEL_ID=$(echo "$TARGET_DATA" | cut -d'|' -f2)
-          export HOURS="${INPUT_HOURS:-4.5}"
+          export HOURS="${INPUT_HOURS:-4.0}"
           export OUT_DIR="./streams"
 
           # Disable auto-continuation on short tests (< 1.0 hour) so a 12-min @DWNews test doesn't spawn another run
           export SHIFTS_LEFT=$(python3 -c "h=float('${HOURS}'); s=int('${INPUT_SHIFTS_LEFT:-0}' or 0); print(0 if h < 1.0 else max(0, s))")
           export ACTIVE_TARGET_DATA="$TARGET_DATA"
+          export ALWAYS_CONTINUE=$(echo "${INPUT_ALWAYS_CONTINUE:-true}" | tr '[:upper:]' '[:lower:]')
 
           echo "CHANNEL_HANDLE=$CHANNEL_HANDLE" >> "$GITHUB_ENV"
           echo "ACTIVE_TARGET_DATA=$TARGET_DATA" >> "$GITHUB_ENV"
+          set +e
           python3 recorder.py
+          RECORDER_RC=$?
+          set -e
 
-          # Fallback dispatch if pre-warm didn't already fire 3m before end, stream is confirmed live, and SHIFTS_LEFT > 0
+          # Fallback dispatch if pre-warm didn't already fire 3m before end and SHIFTS_LEFT > 0
+          # (always_continue=true: even if offline; false: only if confirmed still live)
           NEED_DISPATCH=$(python3 - <<'PY'
-          import glob, json
+          import glob, json, os
+          always = os.environ.get("ALWAYS_CONTINUE", "true") == "true"
+          dispatched = False
+          live = False
           for p in glob.glob("./streams/*_summary.json"):
               try:
                   d = json.loads(open(p, encoding="utf-8").read())
-                  if d.get("still_live_at_end") and not d.get("continuation_dispatched"):
-                      print("true")
-                      break
+                  dispatched = dispatched or bool(d.get("continuation_dispatched"))
+                  live = live or bool(d.get("still_live_at_end"))
               except Exception:
                   pass
+          print("true" if (not dispatched and (live or always)) else "false")
           PY
           )
           if [ "$NEED_DISPATCH" == "true" ] && [ "${SHIFTS_LEFT:-0}" -gt 0 ] 2>/dev/null; then
             NEXT_SHIFTS=$((SHIFTS_LEFT - 1))
-            echo "Streamer $CHANNEL_HANDLE confirmed still live at shift end -> dispatching continuation shift (shifts_left=$NEXT_SHIFTS)..."
+            echo "Streamer $CHANNEL_HANDLE: dispatching continuation shift (always_continue=$ALWAYS_CONTINUE, shifts_left=$NEXT_SHIFTS)..."
             gh workflow run record.yml --ref "${GITHUB_REF_NAME}" \
               -f hours="${HOURS}" \
               -f shifts_left="${NEXT_SHIFTS}" \
+              -f always_continue="${ALWAYS_CONTINUE}" \
               -f custom_target="${TARGET_DATA}" || true
           fi
+
+          exit "${RECORDER_RC:-0}"
 
       - name: Auto-Upload to Gofile (Bounded Budget + Fallback to Google Drive)
         if: always()
@@ -116,12 +153,6 @@ jobs:
           if [ -z "${CHANNEL_HANDLE:-}" ]; then
             exit 0
           fi
-
-          # 1. Stop any lingering downloader/encoder processes and flush file buffers
-          pkill -9 -f ffmpeg 2>/dev/null || true
-          pkill -9 -f yt-dlp 2>/dev/null || true
-          sleep 2
-          sync 2>/dev/null || true
 
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq curl rclone
@@ -164,7 +195,7 @@ jobs:
 
           echo "### Recording Upload Summary: \`${CHANNEL_HANDLE}\`" >> "$GITHUB_STEP_SUMMARY"
 
-          # Total Gofile time budget across all files = 1800s (30 min), guaranteeing >= 65 min for Drive fallback
+          # Total Gofile time budget across all files = 1800s (30 min), leaving ~50-80 min for Drive fallback
           GOFILE_DEADLINE=$(( $(date +%s) + 1800 ))
           RUN_UTC_TAG=$(date -u +"%Y%m%d_%H%MUTC")
 

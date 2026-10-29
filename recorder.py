@@ -1,11 +1,13 @@
 """
-YouTube Live Recorder -- Cloud Runner Engine (v6 Hardened 2-File Edition)
+YouTube Live Recorder -- Cloud Runner Engine (v7 Always-Continue Edition)
 Verified by automated sandbox unit tests covering:
 1. Pre-warm continuation sets CONTINUATION_DISPATCHED=True ONLY on gh returncode==0
 2. Pre-warm throttled (max 2 attempts, 60s backoff) so failed gh never spams the 2s poll loop
 3. Pre-warm requires active byte growth within the last 15s ((now - last_growth_at) <= 15)
 4. Removed dead normal_end branch in record_until_stop
 5. Same-live_id session reuse + short_chunk_preserved return + FFmpegFD HTTP reconnect flags
+6. v7: ALWAYS_CONTINUE (default true) pre-warms the next shift 3 min before the cap even when the streamer is
+   offline/idle, so a streamer who goes live right after a shift boundary is never missed
 """
 
 import atexit
@@ -35,8 +37,9 @@ except Exception:
 CHANNEL_HANDLE = os.getenv("CHANNEL_HANDLE", "@Apka-aashu").strip()
 TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "UCGFi8l9sf5ab4hVJf7byBZg").strip()
 START_AT_IST = os.getenv("START_AT_IST", "").strip()
-HOURS = min(4.5, max(0.05, float(os.getenv("HOURS", "2.0"))))
+HOURS = min(4.5, max(0.05, float(os.getenv("HOURS", "4.0"))))
 SHIFTS_LEFT = int(os.getenv("SHIFTS_LEFT", "0") or "0")
+ALWAYS_CONTINUE = os.getenv("ALWAYS_CONTINUE", "true").strip().lower() in ("1", "true", "yes")
 OUT_DIR = os.getenv("OUT_DIR", "./streams").strip()
 
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.txt").strip()
@@ -564,7 +567,7 @@ def probe_secondary():
 
 
 def confirm_still_live(video_id):
-    """Fast direct check on known video_id first (~2s), falling back to channel probes if needed."""
+    """Direct check on known video_id first (15s timeout), falling back to channel probes if needed."""
     try:
         if video_id and validate_candidate(video_id, None):
             return True
@@ -618,6 +621,8 @@ def maybe_prewarm_continuation_shift():
         "-f", f"shifts_left={next_shifts}",
         "-f", f"custom_target={target_data}",
     ]
+    if os.getenv("ALWAYS_CONTINUE") is not None:  # only pass when workflow defines the input (older record.yml rejects unknown inputs)
+        cmd += ["-f", f"always_continue={'true' if ALWAYS_CONTINUE else 'false'}"]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
         if res.returncode == 0:
@@ -638,32 +643,13 @@ def stop_proc(process):
     try:
         if process.poll() is not None:
             return
-        if sys.platform != "win32":
-            try:
-                pgid = os.getpgid(process.pid)
-                os.killpg(pgid, signal.SIGTERM)
-            except Exception:
-                process.terminate()
-        else:
-            process.terminate()
-        try:
-            process.wait(timeout=10)
-            return
-        except Exception:
-            if sys.platform != "win32":
-                try:
-                    pgid = os.getpgid(process.pid)
-                    os.killpg(pgid, signal.SIGKILL)
-                except Exception:
-                    process.kill()
-            else:
-                process.kill()
-            process.wait(timeout=5)
+        process.terminate()
+        process.wait(timeout=10)
+        return
     except Exception:
-        pass
-    if sys.platform != "win32":
         try:
-            subprocess.run(["pkill", "-9", "-f", "ffmpeg"], capture_output=True, timeout=2)
+            process.kill()
+            process.wait(timeout=5)
         except Exception:
             pass
 
@@ -939,6 +925,8 @@ def output_reader(stream, output_state):
             break
         print(raw_line, end="", flush=True)
         lowered = normalize_message(raw_line)
+        if "chosen=" in raw_line:
+            output_state["chosen_seen"] = True
         if "chosen=" in raw_line or "error:" in lowered or "warning:" in lowered:
             log_raw("yt_dlp", raw_line)
         output_state["botcheck"] |= any(marker in lowered for marker in BOTCHECK_MARKERS)
@@ -958,10 +946,10 @@ def classify_output(output_state):
 def make_download_cmd(active, chunk_path, client):
     command = [
         sys.executable, "-m", "yt_dlp", "--no-config", "--newline", "--no-warnings",
-        "--restrict-filenames", "--no-part", "--no-playlist", "--no-live-from-start", "--match-filter", "is_live",
+        "--restrict-filenames", "--no-part", "--no-playlist", "--no-live-from-start", "--match-filters", "is_live",
         "--fixup", "never",
         "--downloader-args", "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 10",
-        "--print", "before_dl:chosen=%(format_id)s | %(resolution)s | tbr=%(tbr)s | protocol=%(protocol)s",
+        "--print", "before_dl:chosen=%(format_id)s | %(resolution)s | tbr=%(tbr)s | protocol=%(protocol)s", "--no-quiet",
         "--retries", "20", "--extractor-retries", "20", "--file-access-retries", "20",
         "--fragment-retries", "infinite", "--retry-sleep", "http:2", "--retry-sleep", "fragment:1",
         "--skip-unavailable-fragments", "--hls-use-mpegts", "--downloader", "m3u8:native", "-N", "1",
@@ -1056,7 +1044,7 @@ def run_download_attempt(active, session_end, client, live_queue):
     log(f"[{hms(left)} left] download_started | chunk={index:04d} | client={client_label(client)}")
 
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, start_new_session=(sys.platform != "win32"))
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
     except Exception as exc:
         log_raw("download_launch_error", exc)
         active["recording_path"] = None
@@ -1067,7 +1055,7 @@ def run_download_attempt(active, session_end, client, live_queue):
         CURRENT_PROC = process
     DOWNLOAD_ACTIVE.set()
 
-    output_state = {"botcheck": False, "no_formats": False, "rate_limited": False, "not_live": False, "normal_exit": False}
+    output_state = {"botcheck": False, "no_formats": False, "rate_limited": False, "not_live": False, "normal_exit": False, "chosen_seen": False}
     reader = threading.Thread(target=output_reader, args=(process.stdout, output_state), daemon=True)
     reader.start()
 
@@ -1104,11 +1092,11 @@ def run_download_attempt(active, session_end, client, live_queue):
                 last_size, last_growth_at = size, now
                 active["offline_since"] = None
 
-            # Pre-warm continuation shift 3m before session_end ONLY if bytes grew within the last 15s
-            if (
-                (session_end - now) <= PREWARM_LEAD_SECONDS
-                and last_size >= MIN_SAVE_BYTES
-                and (now - last_growth_at) <= PREWARM_ACTIVE_GROWTH_SEC
+            # Pre-warm next shift 3m before session_end. ALWAYS_CONTINUE=true: unconditionally (covers a streamer who
+            # goes live right after this shift ends). Otherwise only if bytes grew within the last 15s.
+            if (session_end - now) <= PREWARM_LEAD_SECONDS and (
+                ALWAYS_CONTINUE
+                or (last_size >= MIN_SAVE_BYTES and (now - last_growth_at) <= PREWARM_ACTIVE_GROWTH_SEC)
             ):
                 maybe_prewarm_continuation_shift()
 
@@ -1132,6 +1120,8 @@ def run_download_attempt(active, session_end, client, live_queue):
     duration = time.time() - started_at
     saved_path = finalize_download_path(chunk_path)
     saved_bytes = os.path.getsize(saved_path) if (saved_path and os.path.isfile(saved_path)) else 0
+    if process.returncode == 0 and saved_bytes == 0 and not output_state.get("chosen_seen") and stop_reason is None and not STOP_REQUESTED:
+        output_state["not_live"] = True
     explicit_end = output_state["not_live"] or output_state["normal_exit"]
 
     unexpected_short_exit = (
@@ -1305,11 +1295,14 @@ if __name__ == "__main__":
     primary_thread.start()
     secondary_thread.start()
 
-    log(f"started | channel={CHANNEL_HANDLE} | id={TARGET_CHANNEL_ID} | duration={HOURS}h | shifts_left={SHIFTS_LEFT} | cookies={USE_COOKIES} | stall=240s")
+    write_summary(status="monitoring", continuation_dispatched=False)
+    log(f"started | channel={CHANNEL_HANDLE} | id={TARGET_CHANNEL_ID} | duration={HOURS}h | shifts_left={SHIFTS_LEFT} | always_continue={ALWAYS_CONTINUE} | cookies={USE_COOKIES} | stall=240s")
 
     try:
         while time.time() < session_end and not STOP_REQUESTED:
             now = time.time()
+            if ALWAYS_CONTINUE and (session_end - now) <= PREWARM_LEAD_SECONDS:
+                maybe_prewarm_continuation_shift()  # idle/offline case (throttled: max 2 attempts, 60s backoff)
             candidate = drain_latest_candidate(live_queue)
 
             if candidate:
@@ -1381,5 +1374,10 @@ if __name__ == "__main__":
 
     if active:
         close_session(active, "session complete")
+    elif SUMMARY.get("status") == "session_closed":
+        write_summary(continuation_dispatched=CONTINUATION_DISPATCHED)
+    else:
+        write_summary(status="offline_complete", close_reason="offline throughout shift", continuation_dispatched=CONTINUATION_DISPATCHED)
 
     log("session_complete")
+
