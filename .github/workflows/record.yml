@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       hours:
-        description: "Recording duration per shift in hours (default 4.0; use 0.2 for a 12-min test)"
+        description: "Recording duration per shift in hours (default 4.5)"
         required: false
-        default: "1.0"
+        default: "4.5"
         type: string
       shifts_left:
-        description: "Continuation shifts after this one (default 1 = up to 2 shifts / ~8h total; auto-disabled if hours < 1.0)"
+        description: "Continuation shifts after this one (default 1 = up to 2 shifts / 9h total)"
         required: false
         default: "1"
         type: string
@@ -102,7 +102,7 @@ jobs:
           export OUT_DIR="./streams"
 
           # Disable auto-continuation on short tests (< 1.0 hour) so a 12-min @DWNews test doesn't spawn another run
-          export SHIFTS_LEFT=$(python3 -c "h=float('${HOURS}'); s=int('${INPUT_SHIFTS_LEFT:-0}' or 0); print(0 if h < 1.0 else max(0, s))")
+          export SHIFTS_LEFT=$(python3 -c "h=float('${HOURS}'); s=int('${INPUT_SHIFTS_LEFT:-0}' or 0); print(0 if h < 0.1 else max(0, s))")
           export ACTIVE_TARGET_DATA="$TARGET_DATA"
           export ALWAYS_CONTINUE=$(echo "${INPUT_ALWAYS_CONTINUE:-true}" | tr '[:upper:]' '[:lower:]')
 

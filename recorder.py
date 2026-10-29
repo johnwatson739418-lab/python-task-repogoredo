@@ -595,7 +595,7 @@ def maybe_prewarm_continuation_shift():
     if (
         CONTINUATION_DISPATCHED
         or SHIFTS_LEFT <= 0
-        or HOURS < 1.0
+        or HOURS < 0.1
         or PREWARM_ATTEMPTS >= PREWARM_MAX_ATTEMPTS
         or now < NEXT_PREWARM_AT
     ):
