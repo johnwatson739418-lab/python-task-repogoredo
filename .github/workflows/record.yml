@@ -135,8 +135,6 @@ jobs:
               if curl -s -x http://127.0.0.1:8118 --max-time 4 https://www.cloudflare.com/cdn-cgi/trace | grep -qE "warp=(on|plus)"; then
                 echo "Privoxy HTTP proxy verified ACTIVE on 127.0.0.1:8118"
                 echo "HTTP_PROXY_URL=http://127.0.0.1:8118" >> "$GITHUB_ENV"
-                echo "http_proxy=http://127.0.0.1:8118" >> "$GITHUB_ENV"
-                echo "https_proxy=http://127.0.0.1:8118" >> "$GITHUB_ENV"
                 break
               fi
               sleep 1
@@ -187,6 +185,7 @@ jobs:
 
           export CHANNEL_HANDLE=$(echo "$TARGET_DATA" | cut -d'|' -f1)
           export TARGET_CHANNEL_ID=$(echo "$TARGET_DATA" | cut -d'|' -f2)
+          echo "CHANNEL_HANDLE=$CHANNEL_HANDLE" >> "$GITHUB_ENV"
           export HOURS="${INPUT_HOURS:-4.0}"
           export OUT_DIR="./streams"
 
@@ -303,13 +302,19 @@ jobs:
       - name: Auto-Upload to Gofile (Bounded Budget + Fallback to Google Drive)
         if: always()
         env:
+          TARGET_DATA: ${{ matrix.target }}
           RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG || secrets.RCLONE_CONFIG_DATA }}
           GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          # Ensure uploads run direct at full runner speed without proxy
+          unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
           if [ -z "${CHANNEL_HANDLE:-}" ]; then
-            exit 0
+            CHANNEL_HANDLE=$(echo "${TARGET_DATA}" | cut -d'|' -f1)
+          fi
+          if [ -z "${CHANNEL_HANDLE:-}" ]; then
+            CHANNEL_HANDLE="recorded_channel"
           fi
 
           sudo apt-get update -qq
