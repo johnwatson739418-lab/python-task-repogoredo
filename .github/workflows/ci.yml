@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    name: Run test_v87.py Unit Tests
+    name: Run Unit Tests
     runs-on: ubuntu-latest
 
     steps:
@@ -22,7 +22,9 @@ jobs:
 
       - name: Run Test Suite
         run: |
-          if [ -f "test_v87.py" ]; then
+          if [ -f "test_v88.py" ]; then
+            python test_v88.py -v
+          elif [ -f "test_v87.py" ]; then
             python test_v87.py -v
           else
             python test_v83.py -v

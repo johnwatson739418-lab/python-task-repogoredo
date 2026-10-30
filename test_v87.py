@@ -15,6 +15,8 @@ class TestRecorderV87Final(unittest.TestCase):
         recorder.YTDLP_PROBE_COOLDOWN_UNTIL = 0.0
         recorder.TARGET["channel_id"] = "UCNty54b8Vzmk-9BRYfF0EVQ"
         recorder.SUMMARY["blocked_by_youtube"] = False
+        recorder._WARP_CACHE.update({"t": 0.0, "v": ""})
+        recorder.WARP_PREFERRED_UNTIL = 0.0
 
     def test_01_claude_125kb_offset_ytinitialdata(self):
         padding = "A" * 125_000
@@ -141,6 +143,7 @@ class TestRecorderV87Final(unittest.TestCase):
         self.assertEqual(recorder.warp_proxy_url(), "")
 
         # Mock a healthy SOCKS5 server returning \x05\x00
+        recorder._WARP_CACHE.update({"t": 0.0, "v": ""})
         mock_sock = MagicMock()
         mock_sock.__enter__.return_value = mock_sock
         mock_sock.recv.return_value = b"\x05\x00"
@@ -148,6 +151,7 @@ class TestRecorderV87Final(unittest.TestCase):
             self.assertEqual(recorder.warp_proxy_url(), "socks5://127.0.0.1:40000")
 
         # Mock a port that accepts TCP but returns garbage instead of SOCKS5 \x05\x00 -> must return ""
+        recorder._WARP_CACHE.update({"t": 0.0, "v": ""})
         mock_sock.recv.return_value = b"HTTP"
         with patch("recorder.socket.create_connection", return_value=mock_sock):
             self.assertEqual(recorder.warp_proxy_url(), "")
@@ -269,10 +273,10 @@ class TestRecorderV87Final(unittest.TestCase):
             self.assertEqual(status, "RECORD_PASS", "Must claim RECORD_PASS with finalized, non-empty media file")
 
 
-    def test_17_technical_difficulties_detected_as_rate_limited(self):
-        """Verify Kaggle @floxiclip chunk 3 error 'We're experiencing technical difficulties.' triggers rate_limited."""
+    def test_17_technical_difficulties_detected_as_transient(self):
+        """Verify Kaggle @floxiclip chunk 3 error 'We're experiencing technical difficulties.' is detected as transient."""
         lowered = recorder.normalize_message("ERROR: [youtube] LSClhQ75Ot8: We're experiencing technical difficulties.")
-        self.assertTrue(any(m in lowered for m in recorder.RATE_LIMIT_MARKERS))
+        self.assertTrue(any(m in lowered for m in getattr(recorder, "TRANSIENT_MARKERS", recorder.RATE_LIMIT_MARKERS)))
 
     def test_18_sticky_warp_proxy_and_skip_webpage_retry(self):
         """Verify record_until_stop retries skip_webpage=False on WARP when skip_webpage=True returns no_formats."""
@@ -311,18 +315,20 @@ if __name__ == "__main__":
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     assert result.wasSuccessful(), "Unit tests failed"
 
-    zip_path = "Recorder-v8.7-Final.zip"
-    yml_src = "record.yml" if os.path.exists("record.yml") else ".github/workflows/record.yml"
-    ci_src = "ci.yml" if os.path.exists("ci.yml") else ".github/workflows/ci.yml"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write("recorder.py", "recorder.py")
-        if os.path.exists(yml_src):
-            zf.write(yml_src, ".github/workflows/record.yml")
-        if os.path.exists(ci_src):
-            zf.write(ci_src, ".github/workflows/ci.yml")
-        zf.write("streamers_16_config.json", "streamers_16_config.json")
-        if os.path.exists("test_v87.py"):
-            zf.write("test_v87.py", "test_v87.py")
-        if os.path.exists("test_v83.py"):
-            zf.write("test_v83.py", "test_v83.py")
-    print("Packaged Recorder-v8.7-Final.zip:", os.path.getsize(zip_path), "bytes")
+    for zip_path in ("Recorder-v8.8-Final.zip", "Recorder-v8.7-Final.zip"):
+        yml_src = "record.yml" if os.path.exists("record.yml") else ".github/workflows/record.yml"
+        ci_src = "ci.yml" if os.path.exists("ci.yml") else ".github/workflows/ci.yml"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write("recorder.py", "recorder.py")
+            if os.path.exists(yml_src):
+                zf.write(yml_src, ".github/workflows/record.yml")
+            if os.path.exists(ci_src):
+                zf.write(ci_src, ".github/workflows/ci.yml")
+            zf.write("streamers_16_config.json", "streamers_16_config.json")
+            if os.path.exists("test_v87.py"):
+                zf.write("test_v87.py", "test_v87.py")
+            if os.path.exists("test_v88.py"):
+                zf.write("test_v88.py", "test_v88.py")
+            if os.path.exists("test_v83.py"):
+                zf.write("test_v83.py", "test_v83.py")
+        print(f"Packaged {zip_path}:", os.path.getsize(zip_path), "bytes")

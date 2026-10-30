@@ -18,6 +18,11 @@ name: Stream Recorder
         required: false
         default: "true"
         type: string
+      use_cookies:
+        description: "Set to true to use YT_COOKIES secret if available (default false)"
+        required: false
+        default: "false"
+        type: string
       custom_target:
         description: "Optional single channel override (e.g. @DWNews| or @prankurv123|UCYe2VVWgjUoEEn9LaLSCk9w). Leave empty for full matrix."
         required: false
@@ -145,8 +150,10 @@ jobs:
           INPUT_HOURS: ${{ github.event.inputs.hours || '4.0' }}
           INPUT_SHIFTS_LEFT: ${{ github.event.inputs.shifts_left || '1' }}
           INPUT_ALWAYS_CONTINUE: ${{ github.event.inputs.always_continue || 'true' }}
+          INPUT_USE_COOKIES: ${{ github.event.inputs.use_cookies || 'false' }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GH_FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           # Default Cookie-Free (matching Kaggle v2.3 & john-ansh): expired/shared YT_COOKIES across 16 repos
@@ -154,6 +161,12 @@ jobs:
           # and disables android_vr/ios clients in yt-dlp!
           export USE_COOKIES="false"
           export COOKIE_FILE=""
+          if [ "${INPUT_USE_COOKIES}" == "true" ] && [ -n "$YT_COOKIES" ]; then
+            echo "$YT_COOKIES" > cookies.txt
+            export USE_COOKIES="true"
+            export FORCE_COOKIES="true"
+            export COOKIE_FILE="cookies.txt"
+          fi
 
           export CHANNEL_HANDLE=$(echo "$TARGET_DATA" | cut -d'|' -f1)
           export TARGET_CHANNEL_ID=$(echo "$TARGET_DATA" | cut -d'|' -f2)

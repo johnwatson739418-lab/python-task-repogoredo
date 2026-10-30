@@ -1,15 +1,19 @@
 """
-YouTube Live Recorder -- Cloud Runner Engine (v8.7 Final Verified Edition)
-Fixes verified by test_v82.py unit test suite:
-1. Full-page marker scan in inspect_youtube_html() (fixes 25KB truncation bug on 120KB+ YouTube pages).
-2. 5-State HTML classification: LIVE, UPCOMING, NOT_LIVE, BLOCKED, ERROR.
-   - UPCOMING scheduled streams are NEVER added to NON_LIVE_VOD_CACHE so they are detected as soon as they go live.
-   - NOT_LIVE VODs from RSS are cached in NON_LIVE_VOD_CACHE (0 yt-dlp calls on old VODs).
-3. BLOCKED takes strict priority over NOT_LIVE in probe_fast() telemetry so blocked /live pages are never masked by home HTML.
-4. Explicit isLiveNow: true priority over stale endTimestamp in parse_strict_video_details().
-5. Tri-state check_live_state() (LIVE / ENDED / UNKNOWN) keeps active sessions open & sets still_live_at_end=True if blocked.
-6. Short-test continuation enabled whenever SHIFTS_LEFT > 0 and HOURS >= 0.1.
-7. bgutil PO-Token HTTP server (127.0.0.1:4416) + POSIX process-group cleanup (start_new_session=True, os.killpg).
+YouTube Live Recorder -- Cloud Runner Engine (v8.8)
+
+Builds on v8.7. Changes in v8.8:
+ 1. probe_fast() now checks /live, channel home AND /streams in parallel (3 workers),
+    so vertical / Shorts-style lives that only show a LIVE badge on /streams are caught in ~20s.
+ 2. Chrome TLS impersonation is gated on a real capability check (yt-dlp --list-impersonate-targets),
+    so a failed curl-cffi install can no longer break every web-type client.
+ 3. WARP preference is time-boxed (WARP_PREFER_SECONDS) instead of sticky-for-the-whole-run, and
+    every route (WARP / direct) is tried in order, so a blocked WARP IP falls back to direct.
+ 4. "experiencing technical difficulties" is a TRANSIENT, client-specific error: it switches client
+    but only escalates to an IP-block (WARP) after it hits 2+ different clients in one pass.
+ 5. Dispatch of the next shift tries GH_TOKEN, then GH_FALLBACK_TOKEN, and logs real errors.
+ 6. Dropped ffmpeg-only downloader args that were ignored by the native HLS downloader.
+ 7. botcheck streak resets after a successful chunk; WARP health check is cached (15s).
+ 8. Optional use_cookies pass-through to continuation shifts.
 """
 
 import atexit
@@ -52,8 +56,6 @@ if COOKIE_FILE and os.path.isfile(COOKIE_FILE):
     except Exception:
         pass
 
-# Default cookie-free (FORCE_COOKIES=true required to enable cookies, because expired/shared YT_COOKIES
-# trigger 'The current session has been rate-limited by YouTube for up to an hour' and disable android_vr/ios!)
 USE_COOKIES = (
     os.getenv("FORCE_COOKIES", "false").lower() == "true"
     and os.getenv("USE_COOKIES", "false").lower() == "true"
@@ -83,13 +85,13 @@ POLL_INTERVAL_SECONDS = 2
 STALL_SECONDS = 240
 OFFLINE_GRACE_SECONDS = 180
 FAILURE_COOLDOWN_SECONDS = 8
-PREWARM_LEAD_SECONDS = 180       # Dispatch next shift 3 min before session_end while actively recording
-PREWARM_MAX_ATTEMPTS = 2         # At most 2 prewarm attempts per shift
-PREWARM_BACKOFF_SECONDS = 60     # 60s backoff between prewarm attempts
-PREWARM_ACTIVE_GROWTH_SEC = 15   # Stream must have written new bytes within last 15s to prewarm
+PREWARM_LEAD_SECONDS = 180
+PREWARM_MAX_ATTEMPTS = 2
+PREWARM_BACKOFF_SECONDS = 60
+PREWARM_ACTIVE_GROWTH_SEC = 15
 
 MIN_SAVE_BYTES = 1_000_000
-MIN_FREE_DISK_BYTES = 512 * 1024 * 1024  # 512 MB safety floor on runner
+MIN_FREE_DISK_BYTES = 512 * 1024 * 1024
 COPY_BUFFER_BYTES = 8 * 1024 * 1024
 
 SHORT_EXIT_PROTECTION_SECONDS = 90
@@ -105,13 +107,20 @@ COOKIE_INCOMPATIBLE_CLIENTS = {"android_vr", "android", "ios"}
 IMPERSONATE_CLIENTS = {"mweb", "web_safari", "tv", None}
 BOTCHECK_BASE_COOLDOWN_SECONDS = 45
 
+# How long to keep preferring the WARP route after a direct (Azure) IP block was seen.
+WARP_PREFER_SECONDS = 600
+WARP_CHECK_CACHE_SECONDS = 15
+
 BGUTIL_PROC = None
 POT_SERVER_ACTIVE = False
+IMPERSONATE_OK = False
 NON_LIVE_VOD_CACHE = set()
 YTDLP_PROBE_COOLDOWN_UNTIL = 0.0
+WARP_PREFERRED_UNTIL = 0.0
 LAST_BLOCKED_LOG_AT = 0.0
 LAST_HEARTBEAT_LOG_AT = 0.0
 PROBE_STATS = {"clean_offline": 0, "blocked": 0, "error": 0, "live_hits": 0}
+_WARP_CACHE = {"t": 0.0, "v": ""}
 
 SESSION_ACTIVE = threading.Event()
 DOWNLOAD_ACTIVE = threading.Event()
@@ -207,11 +216,21 @@ RATE_LIMIT_MARKERS = [
     "the current session has been rate-limited",
     "http error 429",
     "too many requests",
-    "experiencing technical difficulties",
 ]
+# Client-specific / temporary YouTube-side error. Switch client first; only treat as an IP block
+# if it keeps happening across several different clients (see record_until_stop).
+TRANSIENT_MARKERS = ["experiencing technical difficulties"]
 ACCESS_RESTRICTED_MARKERS = ["http error 403", "try again later", "this content isn't available"]
-NOT_LIVE_MARKERS = ["the channel is not currently live", "this live event will begin", "this live event has ended", "does not pass filter"]
+NOT_LIVE_MARKERS = [
+    "the channel is not currently live",
+    "this live event will begin",
+    "this live event has ended",
+    "does not pass filter",
+]
 NORMAL_END_MARKERS = ["finished downloading", "download complete", "has already been downloaded"]
+
+IP_BLOCK_REASONS = {"botcheck", "rate_limited", "access_restricted"}
+CLIENT_SWITCH_REASONS = IP_BLOCK_REASONS | {"no_formats", "transient"}
 
 
 SUMMARY = {
@@ -248,13 +267,65 @@ def command_exists(name):
     return shutil.which(name) is not None
 
 
+# --------------------------------------------------------------------------------------
+# Route selection (direct vs Cloudflare WARP)
+# --------------------------------------------------------------------------------------
+
+def warp_proxy_url():
+    """Verify local Cloudflare WARP SOCKS5 proxy on 127.0.0.1:40000 via SOCKS5 handshake. Cached briefly when active."""
+    now = time.time()
+    if now - _WARP_CACHE["t"] < WARP_CHECK_CACHE_SECONDS and _WARP_CACHE["v"]:
+        return _WARP_CACHE["v"]
+    value = ""
+    try:
+        with socket.create_connection(("127.0.0.1", 40000), timeout=0.8) as sock:
+            sock.settimeout(0.8)
+            sock.sendall(b"\x05\x01\x00")
+            if sock.recv(2) == b"\x05\x00":
+                value = os.getenv("WARP_PROXY", "").strip() or "socks5://127.0.0.1:40000"
+    except Exception:
+        value = ""
+    _WARP_CACHE["t"], _WARP_CACHE["v"] = now, value
+    return value
+
+
+def prefer_warp():
+    """True only while the time-boxed WARP preference is active and the proxy is really up."""
+    return time.time() < WARP_PREFERRED_UNTIL and bool(warp_proxy_url())
+
+
+def mark_ip_blocked(reason):
+    """Record a direct-IP block. Prefers WARP for WARP_PREFER_SECONDS, then re-tests direct."""
+    global WARP_PREFERRED_UNTIL
+    write_summary(blocked_by_youtube=True)
+    if warp_proxy_url():
+        was_preferred = prefer_warp()
+        WARP_PREFERRED_UNTIL = time.time() + WARP_PREFER_SECONDS
+        if not was_preferred:
+            log(f"warp_preferred | reason={reason} | for={WARP_PREFER_SECONDS}s then direct is re-tested")
+
+
+def route_order():
+    """Ordered list of routes to try: True = WARP proxy, False = direct."""
+    if not warp_proxy_url():
+        return [False]
+    return [True, False] if prefer_warp() else [False, True]
+
+
+# --------------------------------------------------------------------------------------
+# Dependencies / yt-dlp arguments
+# --------------------------------------------------------------------------------------
+
 def start_bgutil_pot_server():
     """Start or attach to local bgutil PO-token HTTP server on 127.0.0.1:4416."""
     global BGUTIL_PROC, POT_SERVER_ACTIVE
     curl_bin = shutil.which("curl")
     if curl_bin:
         try:
-            chk = subprocess.run([curl_bin, "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "2", "http://127.0.0.1:4416/ping"], capture_output=True, text=True, timeout=3)
+            chk = subprocess.run(
+                [curl_bin, "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "2", "http://127.0.0.1:4416/ping"],
+                capture_output=True, text=True, timeout=3,
+            )
             if chk.returncode == 0 and chk.stdout.strip() == "200":
                 POT_SERVER_ACTIVE = True
                 return True
@@ -286,7 +357,10 @@ def start_bgutil_pot_server():
         for _ in range(10):
             time.sleep(1)
             if curl_bin:
-                chk = subprocess.run([curl_bin, "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "2", "http://127.0.0.1:4416/ping"], capture_output=True, text=True, timeout=3)
+                chk = subprocess.run(
+                    [curl_bin, "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "2", "http://127.0.0.1:4416/ping"],
+                    capture_output=True, text=True, timeout=3,
+                )
                 if chk.returncode == 0 and chk.stdout.strip() == "200":
                     POT_SERVER_ACTIVE = True
                     return True
@@ -295,18 +369,30 @@ def start_bgutil_pot_server():
     return False
 
 
-def warp_proxy_url():
-    """Verify local Cloudflare WARP SOCKS5 proxy on 127.0.0.1:40000 via SOCKS5 handshake (\x05\x01\x00 -> \x05\x00)."""
+def detect_impersonation():
+    """Enable --impersonate chrome only if yt-dlp reports a usable (non-'unavailable') Chrome target."""
+    global IMPERSONATE_OK
+    IMPERSONATE_OK = False
     try:
-        with socket.create_connection(("127.0.0.1", 40000), timeout=0.8) as sock:
-            sock.settimeout(0.8)
-            sock.sendall(b"\x05\x01\x00")
-            resp = sock.recv(2)
-            if resp == b"\x05\x00":
-                return os.getenv("WARP_PROXY", "").strip() or "socks5://127.0.0.1:40000"
-    except Exception:
-        pass
-    return ""
+        result = subprocess.run(
+            [sys.executable, "-m", "yt_dlp", "--list-impersonate-targets"],
+            text=True, capture_output=True, timeout=30,
+        )
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        for line in output.splitlines():
+            low = line.strip().lower()
+            if low.startswith("chrome") and "unavailable" not in low:
+                IMPERSONATE_OK = True
+                break
+    except Exception as exc:
+        log_raw("impersonation_probe_error", exc)
+    return IMPERSONATE_OK
+
+
+def impersonate_args(client):
+    if IMPERSONATE_OK and client in IMPERSONATE_CLIENTS:
+        return ["--impersonate", "chrome"]
+    return []
 
 
 def build_extractor_args(client, skip_webpage=False):
@@ -316,6 +402,8 @@ def build_extractor_args(client, skip_webpage=False):
         yt_parts.append(f"player_client={client}")
         if skip_webpage and client in SKIP_WEBPAGE_CLIENTS:
             yt_parts.append("player_skip=webpage,configs")
+    if POT_SERVER_ACTIVE:
+        yt_parts.append("fetch_pot=always")
     if yt_parts:
         args += ["--extractor-args", "youtube:" + ";".join(yt_parts)]
     if POT_SERVER_ACTIVE:
@@ -328,9 +416,7 @@ def install_dependencies():
     try:
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp[default,curl-cffi]", "bgutil-ytdlp-pot-provider"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     except Exception as exc:
         log_raw("yt_dlp_install_error", exc)
@@ -355,13 +441,17 @@ def install_dependencies():
             log_raw("os_dependency_error", exc)
 
     pot_ok = start_bgutil_pot_server()
+    imp_ok = detect_impersonation()
     version = ""
     try:
         result = subprocess.run([sys.executable, "-m", "yt_dlp", "--version"], text=True, capture_output=True, timeout=15)
         version = result.stdout.strip()
     except Exception:
         pass
-    log(f"yt_dlp_version | {version or 'unknown'} | pot_server={'ACTIVE' if pot_ok else 'INACTIVE'}")
+    log(
+        f"yt_dlp_version | {version or 'unknown'} | pot_server={'ACTIVE' if pot_ok else 'INACTIVE'}"
+        f" | impersonate_chrome={'ON' if imp_ok else 'OFF'} | warp={'ON' if warp_proxy_url() else 'OFF'}"
+    )
 
 
 def js_runtime_args():
@@ -375,6 +465,10 @@ def js_runtime_args():
 
 JS_ARGS = []
 
+
+# --------------------------------------------------------------------------------------
+# HTML fetching / classification
+# --------------------------------------------------------------------------------------
 
 def _run_curl_fetch(curl_bin, url, use_proxy=False):
     cmd = [
@@ -396,19 +490,20 @@ def _run_curl_fetch(curl_bin, url, use_proxy=False):
 
 
 def fetch_text(url):
+    """Fetch a page, trying routes in route_order(); return the first clean page, else the best effort."""
     curl_bin = shutil.which("curl")
     if not curl_bin:
         return ""
-    html = _run_curl_fetch(curl_bin, url, use_proxy=False)
-    if html:
+    best = ""
+    for use_proxy in route_order():
+        html = _run_curl_fetch(curl_bin, url, use_proxy=use_proxy)
+        if not html:
+            continue
         state, _ = inspect_youtube_html(html)
         if state in ("LIVE", "UPCOMING", "NOT_LIVE"):
             return html
-    if warp_proxy_url():
-        proxy_html = _run_curl_fetch(curl_bin, url, use_proxy=True)
-        if proxy_html:
-            return proxy_html
-    return html
+        best = best or html
+    return best
 
 
 TARGET = {
@@ -572,7 +667,6 @@ def parse_strict_video_details(html):
     ended = bool(("isLive" in details) and not is_live and not is_upcoming)
     is_live_now = broadcast.get("isLiveNow")
 
-    # Precedence: LIVE_NOW=True > UPCOMING=True > LIVE_NOW=False > stale endTimestamp
     if is_live_now is True:
         is_live, is_upcoming, ended = True, False, False
     elif is_upcoming:
@@ -595,7 +689,7 @@ def inspect_youtube_html(html):
     """
     Classify fetched YouTube HTML into 5 distinct states across the FULL HTML string:
       - ("LIVE", details_dict)
-      - ("UPCOMING", details_dict)  -> scheduled stream, never cache as VOD!
+      - ("UPCOMING", details_dict)
       - ("NOT_LIVE", details_dict_or_None)
       - ("BLOCKED", None)
       - ("ERROR", None)
@@ -640,7 +734,6 @@ def inspect_youtube_html(html):
     if "ytinitialdata" in lowered or "ytinitialplayerresponse" in lowered or "<yt:videoid>" in lowered:
         target_cid = TARGET.get("channel_id")
         if target_cid and target_cid.lower() not in lowered and "ytinitialdata" in lowered:
-            # If channel_id is known and html has actual channel metadata from a different channel, reject as ERROR
             other_cid = re.search(r'"(?:externalId|channelId|browseId)"\s*:\s*"(UC[A-Za-z0-9_-]{22})"', html)
             if other_cid and other_cid.group(1) != target_cid:
                 return "ERROR", None
@@ -649,14 +742,16 @@ def inspect_youtube_html(html):
     return "ERROR", None
 
 
+# --------------------------------------------------------------------------------------
+# yt-dlp JSON probe
+# --------------------------------------------------------------------------------------
+
 def _exec_ytdlp_json(url, client, use_proxy=False):
     command = [
         sys.executable, "-m", "yt_dlp", "--no-config", "-J",
         "--skip-download", "--no-warnings", "--ignore-no-formats-error",
         "--force-ipv4", "--playlist-items", "1",
-    ] + JS_ARGS + build_extractor_args(client, skip_webpage=False)
-    if client in IMPERSONATE_CLIENTS:
-        command += ["--impersonate", "chrome"]
+    ] + JS_ARGS + build_extractor_args(client, skip_webpage=False) + impersonate_args(client)
     if use_proxy:
         proxy = warp_proxy_url()
         if proxy:
@@ -669,9 +764,8 @@ def _exec_ytdlp_json(url, client, use_proxy=False):
 
 def run_ytdlp_json(url, client):
     global YTDLP_PROBE_COOLDOWN_UNTIL
-    for use_proxy in (False, True):
-        if use_proxy and not warp_proxy_url():
-            continue
+    routes = route_order()
+    for idx, use_proxy in enumerate(routes):
         try:
             result = _exec_ytdlp_json(url, client, use_proxy=use_proxy)
             if result.returncode == 0 and result.stdout.strip():
@@ -684,7 +778,9 @@ def run_ytdlp_json(url, client):
                 return raw
             stderr_low = normalize_message(result.stderr or "")
             if any(m in stderr_low for m in BOTCHECK_MARKERS + RATE_LIMIT_MARKERS):
-                if not use_proxy and warp_proxy_url():
+                if not use_proxy:
+                    mark_ip_blocked("ytdlp_probe")
+                if idx < len(routes) - 1:
                     continue
                 YTDLP_PROBE_COOLDOWN_UNTIL = time.time() + 180
                 PROBE_STATS["blocked"] += 1
@@ -694,6 +790,10 @@ def run_ytdlp_json(url, client):
             pass
     return None
 
+
+# --------------------------------------------------------------------------------------
+# Live detection
+# --------------------------------------------------------------------------------------
 
 def extract_live_badge_ids(html):
     if not html:
@@ -748,15 +848,6 @@ def validate_candidate(video_id, client):
 
 
 def verify_live_id(video_id, source_kind):
-    """
-    Verify a candidate video_id:
-    1. Skip immediately if cached in NON_LIVE_VOD_CACHE (0 network calls).
-    2. Check watch HTML via curl first:
-       - If LIVE and channel matches -> verified immediately (0 yt-dlp calls).
-       - If UPCOMING -> return None WITHOUT caching in NON_LIVE_VOD_CACHE and WITHOUT calling yt-dlp!
-       - If NOT_LIVE (valid page, VOD/ended) or wrong channel -> cache in NON_LIVE_VOD_CACHE and return None WITHOUT calling yt-dlp!
-       - Only if HTML is BLOCKED or ERROR (and not in yt-dlp probe cooldown) -> fallback to yt-dlp validation.
-    """
     video_id = str(video_id or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id) or video_id in NON_LIVE_VOD_CACHE:
         return None
@@ -778,7 +869,6 @@ def verify_live_id(video_id, source_kind):
         return None
 
     if state == "UPCOMING":
-        # Scheduled stream has not started yet -> do NOT cache as VOD so future probes detect it when it goes live!
         return None
 
     if state == "NOT_LIVE":
@@ -810,18 +900,20 @@ def verify_live_id(video_id, source_kind):
 
 def probe_fast():
     """
-    Zero-yt-dlp Idle Probe:
-    - Fetches `/live` and channel home via lightweight curl with consent cookies.
-    - Checks BLOCKED before NOT_LIVE so a blocked `/live` page is never masked by a NOT_LIVE home page.
-    - Never calls yt-dlp when HTML loads cleanly and confirms channel is offline/upcoming.
+    Zero-yt-dlp idle probe, run every ~20s. Fetches in parallel:
+      - /live      (normal lives; redirects to the watch page when live)
+      - channel home
+      - /streams   (vertical / Shorts-style lives often show only a LIVE badge here)
+    BLOCKED takes priority over NOT_LIVE so a blocked page is never masked by a clean one.
     """
     global LAST_BLOCKED_LOG_AT, LAST_HEARTBEAT_LOG_AT, YTDLP_PROBE_COOLDOWN_UNTIL
-    executor = ThreadPoolExecutor(max_workers=2)
+    executor = ThreadPoolExecutor(max_workers=3)
     futures = {
         executor.submit(fetch_text, LIVE_URL): "live",
         executor.submit(fetch_text, CHANNEL_URL): "home",
+        executor.submit(fetch_text, STREAMS_URL): "streams",
     }
-    pages = {"live": "", "home": ""}
+    pages = {"live": "", "home": "", "streams": ""}
 
     try:
         for future in as_completed(futures, timeout=HTML_TIMEOUT_SECONDS + 4):
@@ -837,8 +929,8 @@ def probe_fast():
 
     live_state, live_details = inspect_youtube_html(pages["live"])
     home_state, _ = inspect_youtube_html(pages["home"])
+    streams_state, _ = inspect_youtube_html(pages["streams"])
 
-    # 1. Direct strict match on `/live` HTML videoDetails
     if live_state == "LIVE" and live_details and live_details.get("videoId"):
         target_cid = TARGET.get("channel_id")
         if not target_cid or live_details.get("channelId") == target_cid:
@@ -848,10 +940,9 @@ def probe_fast():
             log(f"detect_live | source=direct_live_html | live id={vid} | client=html_strict | match=strict_videoDetails")
             return {"id": vid, "url": f"https://www.youtube.com/watch?v={vid}", "source": "direct_live_html", "client": "android_vr"}
 
-    # 2. Check live badge candidates on `/live` and home HTML
     seen = set()
-    for page_key in ("live", "home"):
-        for video_id in extract_live_badge_ids(pages[page_key])[:2]:
+    for page_key in ("live", "home", "streams"):
+        for video_id in extract_live_badge_ids(pages[page_key])[:3]:
             if video_id in seen:
                 continue
             seen.add(video_id)
@@ -859,15 +950,16 @@ def probe_fast():
             if result:
                 return result
 
-    # 3. Record explicit telemetry: BLOCKED takes priority over NOT_LIVE!
     now = time.time()
-    if live_state == "BLOCKED" or home_state == "BLOCKED":
+    clean = ("NOT_LIVE", "UPCOMING")
+    if "BLOCKED" in (live_state, home_state, streams_state):
         PROBE_STATS["blocked"] += 1
         write_summary(blocked_by_youtube=True, probe_stats=PROBE_STATS)
+        mark_ip_blocked("html_probe")
         if now - LAST_BLOCKED_LOG_AT >= 120:
             LAST_BLOCKED_LOG_AT = now
             log(f"probe_blocked_warning | YouTube returned botcheck/captcha on HTML probe (blocked={PROBE_STATS['blocked']}, clean={PROBE_STATS['clean_offline']})")
-    elif live_state in ("NOT_LIVE", "UPCOMING") and home_state in ("NOT_LIVE", "UPCOMING"):
+    elif live_state in clean and home_state in clean:
         PROBE_STATS["clean_offline"] += 1
         write_summary(probe_stats=PROBE_STATS)
         if now - LAST_HEARTBEAT_LOG_AT >= 1800 and not SESSION_ACTIVE.is_set():
@@ -878,7 +970,6 @@ def probe_fast():
         PROBE_STATS["error"] += 1
         write_summary(probe_stats=PROBE_STATS)
 
-    # 4. Only when HTML was BLOCKED/ERROR (and cooldown allows), try 1 throttled PO-token yt-dlp check
     if now >= YTDLP_PROBE_COOLDOWN_UNTIL:
         YTDLP_PROBE_COOLDOWN_UNTIL = now + 180
         info = run_ytdlp_json(LIVE_URL, "android_vr")
@@ -888,7 +979,7 @@ def probe_fast():
                 video_id = info["id"]
                 PROBE_STATS["live_hits"] += 1
                 write_summary(probe_stats=PROBE_STATS)
-                log(f"detect_live | source=live_endpoint_fallback | live id={video_id} | client=mweb | match={reason}")
+                log(f"detect_live | source=live_endpoint_fallback | live id={video_id} | client=android_vr | match={reason}")
                 return {"id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}", "source": "live_endpoint", "client": "android_vr"}
 
     return None
@@ -933,12 +1024,6 @@ def probe_secondary():
 
 
 def check_live_state(video_id):
-    """
-    Strict tri-state verification for active session recovery & end checks:
-      - "LIVE": confirmed still live for this exact video_id and target channel_id
-      - "ENDED": positively confirmed ended/VOD for this exact video_id and target channel_id
-      - "UNKNOWN": blocked, network error, upcoming, or unverified page (never false-closes an active session!)
-    """
     if not video_id:
         return "ENDED"
     target_cid = TARGET.get("channel_id")
@@ -967,7 +1052,6 @@ def check_live_state(video_id):
 
 
 def confirm_still_live(video_id):
-    """Direct check on known video_id first (15s timeout); treats UNKNOWN as True for safe continuation."""
     state = check_live_state(video_id)
     if state == "LIVE":
         return True
@@ -980,17 +1064,24 @@ def confirm_still_live(video_id):
                 return True
         except Exception:
             pass
-    # If check_live_state returned UNKNOWN (e.g. verification blocked at shift end), preserve continuation safety
     return state == "UNKNOWN"
 
 
+# --------------------------------------------------------------------------------------
+# Continuation shift dispatch
+# --------------------------------------------------------------------------------------
+
+def dispatch_tokens():
+    """GH_TOKEN first (may be a PAT), then GH_FALLBACK_TOKEN (the built-in GITHUB_TOKEN). De-duplicated."""
+    tokens = []
+    for name in ("GH_TOKEN", "GH_FALLBACK_TOKEN"):
+        value = os.getenv(name, "").strip()
+        if value and value not in tokens:
+            tokens.append(value)
+    return tokens
+
+
 def maybe_prewarm_continuation_shift():
-    """
-    Dispatch next shift 3 minutes before session_end while stream is actively growing.
-    - Sets CONTINUATION_DISPATCHED = True ONLY when gh workflow run succeeds (returncode == 0).
-    - Throttled by PREWARM_MAX_ATTEMPTS (2) and PREWARM_BACKOFF_SECONDS (60s) so failure never spams the loop.
-    - If gh or GH_TOKEN is absent, marks attempts exhausted and leaves CONTINUATION_DISPATCHED = False so YAML fallback can run.
-    """
     global CONTINUATION_DISPATCHED, PREWARM_ATTEMPTS, NEXT_PREWARM_AT
     now = time.time()
     if (
@@ -1003,10 +1094,11 @@ def maybe_prewarm_continuation_shift():
         return
 
     gh_bin = shutil.which("gh")
-    if not gh_bin or not os.getenv("GH_TOKEN"):
+    tokens = dispatch_tokens()
+    if not gh_bin or not tokens:
         PREWARM_ATTEMPTS = PREWARM_MAX_ATTEMPTS
         write_summary(continuation_dispatched=False)
-        log("prewarm_skipped | gh or GH_TOKEN unavailable; deferring to workflow post-run step")
+        log("prewarm_skipped | gh or token unavailable; deferring to workflow post-run step")
         return
 
     PREWARM_ATTEMPTS += 1
@@ -1022,21 +1114,34 @@ def maybe_prewarm_continuation_shift():
         "-f", f"shifts_left={next_shifts}",
         "-f", f"custom_target={target_data}",
     ]
-    if os.getenv("ALWAYS_CONTINUE") is not None:  # only pass when workflow defines the input (older record.yml rejects unknown inputs)
+    if os.getenv("ALWAYS_CONTINUE") is not None:
         cmd += ["-f", f"always_continue={'true' if ALWAYS_CONTINUE else 'false'}"]
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    if os.getenv("INPUT_USE_COOKIES"):
+        cmd += ["-f", f"use_cookies={os.getenv('INPUT_USE_COOKIES').strip().lower()}"]
+
+    last_error = ""
+    for position, token in enumerate(tokens, start=1):
+        env = dict(os.environ, GH_TOKEN=token)
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=20, env=env)
+        except Exception as exc:
+            last_error = f"token#{position} exception: {exc}"
+            continue
         if res.returncode == 0:
             CONTINUATION_DISPATCHED = True
-            log(f"prewarm_continuation_dispatched | attempt={PREWARM_ATTEMPTS} | shifts_left={next_shifts} | target={target_data}")
+            log(f"prewarm_continuation_dispatched | attempt={PREWARM_ATTEMPTS} | token#{position} | shifts_left={next_shifts} | target={target_data}")
             write_summary(continuation_dispatched=True)
-        else:
-            write_summary(continuation_dispatched=False)
-            log_raw("prewarm_dispatch_failed", f"attempt={PREWARM_ATTEMPTS}/{PREWARM_MAX_ATTEMPTS} | {res.stderr}")
-    except Exception as exc:
-        write_summary(continuation_dispatched=False)
-        log_raw("prewarm_dispatch_error", f"attempt={PREWARM_ATTEMPTS}/{PREWARM_MAX_ATTEMPTS} | {exc}")
+            return
+        last_error = f"token#{position} rc={res.returncode} {res.stderr}"
+        log_raw("prewarm_dispatch_token_failed", last_error)
 
+    write_summary(continuation_dispatched=False)
+    log_raw("prewarm_dispatch_failed", f"attempt={PREWARM_ATTEMPTS}/{PREWARM_MAX_ATTEMPTS} | {last_error}")
+
+
+# --------------------------------------------------------------------------------------
+# Process control
+# --------------------------------------------------------------------------------------
 
 def stop_proc(process):
     if process is None:
@@ -1105,6 +1210,10 @@ signal.signal(signal.SIGTERM, sigterm_handler)
 signal.signal(signal.SIGINT, sigterm_handler)
 atexit.register(lambda: (stop_proc(CURRENT_PROC), stop_proc(BGUTIL_PROC)))
 
+
+# --------------------------------------------------------------------------------------
+# Session / chunk bookkeeping
+# --------------------------------------------------------------------------------------
 
 def build_final_path(live_id, session_index=1):
     suffix = "" if session_index == 1 else f"_r{session_index}"
@@ -1216,7 +1325,6 @@ def load_active_state():
 
 
 def new_session(live):
-    """Open or reuse session for live_id so same broadcast never splits into _r2.._r6."""
     live_id = live["id"]
     session_index = 1
     final_ts = build_final_path(live_id, session_index)
@@ -1317,10 +1425,14 @@ def build_final_file(active):
         )
         if result.returncode == 0 and os.path.isfile(final_path) and os.path.getsize(final_path) >= MIN_SAVE_BYTES:
             for path in chunks:
-                try: os.remove(path)
-                except Exception: pass
-            try: os.remove(list_path)
-            except Exception: pass
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            try:
+                os.remove(list_path)
+            except Exception:
+                pass
             return final_path
         log_raw("ffmpeg_concat_failed", result.stderr)
     except Exception as exc:
@@ -1357,6 +1469,10 @@ def close_session(active, reason):
     save_active_state(None)
 
 
+# --------------------------------------------------------------------------------------
+# Downloading
+# --------------------------------------------------------------------------------------
+
 def output_reader(stream, output_state):
     for raw_line in iter(stream.readline, ""):
         if not raw_line:
@@ -1370,24 +1486,26 @@ def output_reader(stream, output_state):
         output_state["botcheck"] |= any(marker in lowered for marker in BOTCHECK_MARKERS)
         output_state["no_formats"] |= any(marker in lowered for marker in NO_FORMAT_MARKERS)
         output_state["rate_limited"] |= any(marker in lowered for marker in RATE_LIMIT_MARKERS)
+        output_state["transient"] |= any(marker in lowered for marker in TRANSIENT_MARKERS)
         output_state["access_restricted"] |= any(marker in lowered for marker in ACCESS_RESTRICTED_MARKERS)
         output_state["not_live"] |= any(marker in lowered for marker in NOT_LIVE_MARKERS)
         output_state["normal_exit"] |= any(marker in lowered for marker in NORMAL_END_MARKERS)
 
 
 def classify_output(output_state):
-    for key in ("botcheck", "rate_limited", "access_restricted", "no_formats", "not_live"):
+    for key in ("botcheck", "rate_limited", "access_restricted", "transient", "no_formats", "not_live"):
         if output_state.get(key):
             return key
     return "normal_end" if output_state.get("normal_exit") else "no_file"
 
 
 def make_download_cmd(active, chunk_path, client, skip_webpage=True, use_proxy=False):
+    # Note: --downloader-args ffmpeg_i:... was removed in v8.8; it is ignored by the native
+    # HLS downloader (-downloader m3u8:native) which does its own fragment retries.
     command = [
         sys.executable, "-m", "yt_dlp", "--no-config", "--newline", "--no-warnings",
         "--restrict-filenames", "--no-part", "--no-playlist", "--no-live-from-start", "--match-filters", "is_live",
         "--force-ipv4", "--fixup", "never",
-        "--downloader-args", "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 10",
         "--print", "before_dl:chosen=%(format_id)s | %(resolution)s | tbr=%(tbr)s | protocol=%(protocol)s", "--no-quiet",
         "--retries", "20", "--extractor-retries", "20", "--file-access-retries", "20",
         "--fragment-retries", "infinite", "--retry-sleep", "http:2", "--retry-sleep", "fragment:1",
@@ -1395,8 +1513,7 @@ def make_download_cmd(active, chunk_path, client, skip_webpage=True, use_proxy=F
         "-f", FORMAT_SELECTOR, "-S", SORT_EXPR, "-o", chunk_path,
     ] + JS_ARGS
 
-    if client in IMPERSONATE_CLIENTS:
-        command += ["--impersonate", "chrome"]
+    command += impersonate_args(client)
     if use_proxy:
         proxy = warp_proxy_url()
         if proxy:
@@ -1424,7 +1541,6 @@ def finalize_download_path(base_path):
         except Exception:
             return path
     return path
-
 
 def validate_finalized_recordings(directory_or_files, min_bytes=MIN_SAVE_BYTES):
     """
@@ -1508,6 +1624,7 @@ def classify_run_status(summary, media_candidates=None):
     return "UNVERIFIED"
 
 
+
 def append_chunk(active, path, client, reason):
     if path not in active["chunks"]:
         active["chunks"].append(path)
@@ -1518,6 +1635,7 @@ def append_chunk(active, path, client, reason):
     active["recording_path"] = None
     active["last_failure_reason"] = None
     active["short_exit_streak"] = 0
+    active["botcheck_streak"] = 0
     active["recovery_needed"] = False
     active["cooldown_until"] = 0
     active["offline_since"] = None
@@ -1568,7 +1686,7 @@ def run_download_attempt(active, session_end, client, live_queue, skip_webpage=T
     command = make_download_cmd(active, chunk_path, client, skip_webpage=skip_webpage, use_proxy=use_proxy)
     left = max(0, session_end - time.time())
     route = "warp_proxy" if (use_proxy and warp_proxy_url()) else "direct"
-    log(f"[{hms(left)} left] download_started | chunk={index:04d} | client={client_label(client)} | route={route}")
+    log(f"[{hms(left)} left] download_started | chunk={index:04d} | client={client_label(client)} | route={route} | skip_webpage={skip_webpage}")
 
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, start_new_session=True)
@@ -1582,7 +1700,10 @@ def run_download_attempt(active, session_end, client, live_queue, skip_webpage=T
         CURRENT_PROC = process
     DOWNLOAD_ACTIVE.set()
 
-    output_state = {"botcheck": False, "no_formats": False, "rate_limited": False, "access_restricted": False, "not_live": False, "normal_exit": False, "chosen_seen": False}
+    output_state = {
+        "botcheck": False, "no_formats": False, "rate_limited": False, "transient": False,
+        "access_restricted": False, "not_live": False, "normal_exit": False, "chosen_seen": False,
+    }
     reader = threading.Thread(target=output_reader, args=(process.stdout, output_state), daemon=True)
     reader.start()
 
@@ -1619,8 +1740,6 @@ def run_download_attempt(active, session_end, client, live_queue, skip_webpage=T
                 last_size, last_growth_at = size, now
                 active["offline_since"] = None
 
-            # Pre-warm next shift 3m before session_end. ALWAYS_CONTINUE=true: unconditionally (covers a streamer who
-            # goes live right after this shift ends). Otherwise only if bytes grew within the last 15s.
             if (session_end - now) <= PREWARM_LEAD_SECONDS and (
                 ALWAYS_CONTINUE
                 or (last_size >= MIN_SAVE_BYTES and (now - last_growth_at) <= PREWARM_ACTIVE_GROWTH_SEC)
@@ -1649,7 +1768,10 @@ def run_download_attempt(active, session_end, client, live_queue, skip_webpage=T
     if process.returncode == 0 and saved_bytes == 0 and not output_state.get("chosen_seen") and stop_reason is None and not STOP_REQUESTED:
         output_state["not_live"] = True
     explicit_end = output_state["not_live"] or output_state["normal_exit"]
-    explicit_error = output_state["botcheck"] or output_state["no_formats"] or output_state["rate_limited"] or output_state["access_restricted"]
+    explicit_error = (
+        output_state["botcheck"] or output_state["no_formats"] or output_state["rate_limited"]
+        or output_state["transient"] or output_state["access_restricted"]
+    )
 
     unexpected_short_exit = (
         stop_reason is None
@@ -1679,21 +1801,29 @@ def run_download_attempt(active, session_end, client, live_queue, skip_webpage=T
             return False, "short_exit", replacement_live
 
     if saved_path and os.path.isfile(saved_path) and saved_bytes >= MIN_SAVE_BYTES:
-        if STOP_REQUESTED: reason = "termination"
-        elif time.time() >= session_end: reason = "session_end"
-        elif stop_reason == "new_live_id": reason = "new_live_id"
-        elif explicit_end: reason = classify_output(output_state)
-        elif stop_reason == "stalled": reason = "stalled"
-        else: reason = "downloader_exit"
+        if STOP_REQUESTED:
+            reason = "termination"
+        elif time.time() >= session_end:
+            reason = "session_end"
+        elif stop_reason == "new_live_id":
+            reason = "new_live_id"
+        elif explicit_end:
+            reason = classify_output(output_state)
+        elif stop_reason == "stalled":
+            reason = "stalled"
+        else:
+            reason = "downloader_exit"
 
         append_chunk(active, saved_path, client, reason)
-        if replacement_live: return True, "new_live_id", replacement_live
-        if reason in {"termination", "session_end", "not_live", "normal_end"}: return True, reason, None
+        if replacement_live:
+            return True, "new_live_id", replacement_live
         return True, reason, None
 
     if saved_path and os.path.isfile(saved_path):
-        try: os.remove(saved_path)
-        except Exception: pass
+        try:
+            os.remove(saved_path)
+        except Exception:
+            pass
 
     active["recording_path"] = None
     reason = classify_output(output_state)
@@ -1707,6 +1837,34 @@ def run_download_attempt(active, session_end, client, live_queue, skip_webpage=T
     return False, reason, replacement_live
 
 
+def can_continue(session_end):
+    return (not STOP_REQUESTED) and time.time() < session_end
+
+
+def attempt_with_fallbacks(active, session_end, client, live_queue):
+    """
+    One logical download attempt for `client`, walking route_order():
+      route -> skip_webpage=True -> (if no_formats on an app client) skip_webpage=False on SAME route
+      -> if the failure is an IP-level block, mark it and try the next route (direct <-> WARP).
+    Any other failure reason ends the walk and is returned to the caller.
+    """
+    routes = route_order()
+    ok, reason, replacement_live = False, "download_failed", None
+    for idx, use_proxy in enumerate(routes):
+        ok, reason, replacement_live = run_download_attempt(active, session_end, client, live_queue, skip_webpage=True, use_proxy=use_proxy)
+        if not ok and reason == "no_formats" and client in SKIP_WEBPAGE_CLIENTS and can_continue(session_end):
+            ok, reason, replacement_live = run_download_attempt(active, session_end, client, live_queue, skip_webpage=False, use_proxy=use_proxy)
+        if ok or replacement_live or not can_continue(session_end):
+            break
+        if reason not in IP_BLOCK_REASONS:
+            break
+        if not use_proxy:
+            mark_ip_blocked(reason)
+        if idx < len(routes) - 1:
+            log(f"route_fallback | client={client_label(client)} | reason={reason} | from={'warp' if use_proxy else 'direct'} | to={'direct' if use_proxy else 'warp'}")
+    return ok, reason, replacement_live
+
+
 def record_until_stop(active, session_end, live_queue):
     if active.get("client_locked") and active.get("preferred_client") in DOWNLOAD_CLIENTS:
         preferred = active["preferred_client"]
@@ -1715,26 +1873,27 @@ def record_until_stop(active, session_end, live_queue):
         clients = list(DOWNLOAD_CLIENTS)
 
     last_reason = "download_failed"
+    transient_clients = set()
     for client in clients:
         short_attempts = 0
-        while time.time() < session_end and not STOP_REQUESTED:
-            prefer_warp = bool(SUMMARY.get("blocked_by_youtube") and warp_proxy_url())
-            ok, reason, replacement_live = run_download_attempt(active, session_end, client, live_queue, skip_webpage=True, use_proxy=prefer_warp)
-            if not ok and reason == "no_formats" and client in SKIP_WEBPAGE_CLIENTS and not STOP_REQUESTED and time.time() < session_end:
-                ok, reason, replacement_live = run_download_attempt(active, session_end, client, live_queue, skip_webpage=False, use_proxy=prefer_warp)
-            if not ok and not prefer_warp and reason in {"botcheck", "rate_limited", "access_restricted"} and warp_proxy_url() and not STOP_REQUESTED and time.time() < session_end:
-                write_summary(blocked_by_youtube=True)
-                log(f"azure_ip_blocked | client={client_label(client)} | reason={reason} | retrying via Cloudflare WARP proxy")
-                ok, reason, replacement_live = run_download_attempt(active, session_end, client, live_queue, skip_webpage=True, use_proxy=True)
-                if not ok and reason == "no_formats" and client in SKIP_WEBPAGE_CLIENTS and not STOP_REQUESTED and time.time() < session_end:
-                    ok, reason, replacement_live = run_download_attempt(active, session_end, client, live_queue, skip_webpage=False, use_proxy=True)
-            if replacement_live: return False, "new_live_id", replacement_live
-            if STOP_REQUESTED: return False, "termination", None
-            if time.time() >= session_end: return False, "session_end", None
-            if reason in {"not_live", "normal_end"}: return False, reason, None
+        while can_continue(session_end):
+            ok, reason, replacement_live = attempt_with_fallbacks(active, session_end, client, live_queue)
+            if replacement_live:
+                return False, "new_live_id", replacement_live
+            if STOP_REQUESTED:
+                return False, "termination", None
+            if time.time() >= session_end:
+                return False, "session_end", None
+            if reason in {"not_live", "normal_end"}:
+                return False, reason, None
             last_reason = reason
 
-            if reason in {"botcheck", "no_formats", "rate_limited", "access_restricted"}:
+            if reason == "transient":
+                transient_clients.add(client_label(client))
+                if len(transient_clients) >= 2:
+                    mark_ip_blocked("transient_on_multiple_clients")
+
+            if reason in CLIENT_SWITCH_REASONS:
                 log(f"client_blocked | client={client_label(client)} | reason={reason} | switching to next client")
                 break
 
@@ -1762,6 +1921,10 @@ def record_until_stop(active, session_end, live_queue):
     save_active_state(active)
     return False, last_reason, None
 
+
+# --------------------------------------------------------------------------------------
+# Detector threads / scheduling
+# --------------------------------------------------------------------------------------
 
 def primary_detector(session_end, stop_event, live_queue):
     next_run = time.time()
@@ -1818,9 +1981,11 @@ def wait_for_start_time():
         log_raw("start_time_error", f"invalid START_AT_IST={value!r} | {exc}")
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
+FAILURE_REASONS = {
+    "not_live", "normal_end", "download_failed", "launch_error",
+    "botcheck", "rate_limited", "access_restricted", "transient", "no_formats", "no_file", "short_exit",
+}
+
 
 if __name__ == "__main__":
     install_dependencies()
@@ -1841,13 +2006,13 @@ if __name__ == "__main__":
     secondary_thread.start()
 
     write_summary(status="monitoring", continuation_dispatched=False)
-    log(f"started | channel={CHANNEL_HANDLE} | id={TARGET_CHANNEL_ID} | duration={HOURS}h | shifts_left={SHIFTS_LEFT} | always_continue={ALWAYS_CONTINUE} | cookies={USE_COOKIES} | stall=240s")
+    log(f"started | channel={CHANNEL_HANDLE} | id={TARGET_CHANNEL_ID} | duration={HOURS}h | shifts_left={SHIFTS_LEFT} | always_continue={ALWAYS_CONTINUE} | cookies={USE_COOKIES} | stall={STALL_SECONDS}s")
 
     try:
         while time.time() < session_end and not STOP_REQUESTED:
             now = time.time()
             if ALWAYS_CONTINUE and (session_end - now) <= PREWARM_LEAD_SECONDS:
-                maybe_prewarm_continuation_shift()  # idle/offline case (throttled: max 2 attempts, 60s backoff)
+                maybe_prewarm_continuation_shift()
             candidate = drain_latest_candidate(live_queue)
 
             if candidate:
@@ -1878,10 +2043,7 @@ if __name__ == "__main__":
                     if reason in {"termination", "session_end"}:
                         break
 
-                    if reason in {
-                        "not_live", "normal_end", "download_failed", "launch_error",
-                        "botcheck", "rate_limited", "access_restricted", "no_formats", "no_file", "short_exit",
-                    }:
+                    if reason in FAILURE_REASONS:
                         active["recovery_needed"] = True
                         active["last_failure_reason"] = reason
                         if reason in {"botcheck", "rate_limited"}:
