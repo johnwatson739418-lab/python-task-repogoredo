@@ -289,6 +289,20 @@ def warp_proxy_url():
     return value
 
 
+def http_bridge_url():
+    """Verify local Privoxy HTTP-to-SOCKS5 bridge on 127.0.0.1:8118 (enables FFmpeg to route through WARP)."""
+    try:
+        with socket.create_connection(("127.0.0.1", 8118), timeout=0.4):
+            return os.getenv("HTTP_PROXY_URL", "").strip() or "http://127.0.0.1:8118"
+    except Exception:
+        return ""
+
+
+def effective_proxy_url():
+    """Returns Privoxy HTTP bridge if active (to unify FFmpeg + yt-dlp on WARP), else WARP SOCKS5."""
+    return http_bridge_url() or warp_proxy_url()
+
+
 def prefer_warp():
     """True only while the time-boxed WARP preference is active and the proxy is really up."""
     return time.time() < WARP_PREFERRED_UNTIL and bool(warp_proxy_url())
@@ -753,9 +767,11 @@ def _exec_ytdlp_json(url, client, use_proxy=False):
         "--force-ipv4", "--playlist-items", "1",
     ] + JS_ARGS + build_extractor_args(client, skip_webpage=False) + impersonate_args(client)
     if use_proxy:
-        proxy = warp_proxy_url()
+        proxy = effective_proxy_url()
         if proxy:
             command += ["--proxy", proxy]
+            if proxy.startswith("http://"):
+                command += ["--downloader-args", f"ffmpeg:-http_proxy {proxy}"]
     if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE) and client not in COOKIE_INCOMPATIBLE_CLIENTS:
         command += ["--cookies", COOKIE_FILE]
     command.append(url)
@@ -1515,9 +1531,11 @@ def make_download_cmd(active, chunk_path, client, skip_webpage=True, use_proxy=F
 
     command += impersonate_args(client)
     if use_proxy:
-        proxy = warp_proxy_url()
+        proxy = effective_proxy_url()
         if proxy:
             command += ["--proxy", proxy]
+            if proxy.startswith("http://"):
+                command += ["--downloader-args", f"ffmpeg:-http_proxy {proxy}"]
     command += build_extractor_args(client, skip_webpage=skip_webpage)
     if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE) and client not in COOKIE_INCOMPATIBLE_CLIENTS:
         command += ["--cookies", COOKIE_FILE]
@@ -1688,8 +1706,19 @@ def run_download_attempt(active, session_end, client, live_queue, skip_webpage=T
     route = "warp_proxy" if (use_proxy and warp_proxy_url()) else "direct"
     log(f"[{hms(left)} left] download_started | chunk={index:04d} | client={client_label(client)} | route={route} | skip_webpage={skip_webpage}")
 
+    proc_env = os.environ.copy()
+    if use_proxy:
+        proxy = effective_proxy_url()
+        if proxy:
+            proc_env["all_proxy"] = proxy
+            proc_env["ALL_PROXY"] = proxy
+            if proxy.startswith("http://"):
+                proc_env["http_proxy"] = proxy
+                proc_env["https_proxy"] = proxy
+                proc_env["HTTP_PROXY"] = proxy
+                proc_env["HTTPS_PROXY"] = proxy
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, start_new_session=True)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, start_new_session=True, env=proc_env)
     except Exception as exc:
         log_raw("download_launch_error", exc)
         active["recording_path"] = None

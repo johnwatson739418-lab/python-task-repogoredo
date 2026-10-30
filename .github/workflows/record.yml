@@ -102,13 +102,13 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Start Cloudflare WARP Proxy (Port 40000) & bgutil PO-Token Server (Port 4416)
+      - name: Start Cloudflare WARP Proxy (Port 40000), Privoxy HTTP Bridge (Port 8118) & bgutil PO-Token Server (Port 4416)
         run: |
           # 1. Start local Cloudflare WARP SOCKS5 proxy on 127.0.0.1:40000 to bypass Azure subnet rate-limits
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null || true
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null 2>&1 || true
           sudo apt-get update -qq 2>/dev/null || true
-          sudo apt-get install -y -qq cloudflare-warp 2>/dev/null || true
+          sudo apt-get install -y -qq cloudflare-warp privoxy 2>/dev/null || true
           if command -v warp-cli >/dev/null 2>&1; then
             sudo systemctl start warp-svc 2>/dev/null || sudo warp-svc &
             sleep 2
@@ -123,6 +123,23 @@ jobs:
                 break
               fi
               sleep 2
+            done
+          fi
+
+          # 2. Start Privoxy HTTP bridge on 127.0.0.1:8118 -> forward to WARP SOCKS5 (Allows FFmpeg to route through WARP without 403)
+          if [ -f "/etc/privoxy/config" ]; then
+            echo "forward-socks5t / 127.0.0.1:40000 ." | sudo tee -a /etc/privoxy/config >/dev/null 2>&1 || true
+            sudo systemctl restart privoxy 2>/dev/null || sudo privoxy /etc/privoxy/config &
+            sleep 1
+            for _ in 1 2 3 4; do
+              if curl -s -x http://127.0.0.1:8118 --max-time 4 https://www.cloudflare.com/cdn-cgi/trace | grep -qE "warp=(on|plus)"; then
+                echo "Privoxy HTTP proxy verified ACTIVE on 127.0.0.1:8118"
+                echo "HTTP_PROXY_URL=http://127.0.0.1:8118" >> "$GITHUB_ENV"
+                echo "http_proxy=http://127.0.0.1:8118" >> "$GITHUB_ENV"
+                echo "https_proxy=http://127.0.0.1:8118" >> "$GITHUB_ENV"
+                break
+              fi
+              sleep 1
             done
           fi
 
