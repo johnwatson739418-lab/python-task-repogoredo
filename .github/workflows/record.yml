@@ -4,9 +4,9 @@ name: Stream Recorder
   workflow_dispatch:
     inputs:
       hours:
-        description: "Recording duration per shift in hours (default 4.0; use 0.2 for a 12-min test)"
+        description: "Recording duration per shift in hours (default 4.5 = 9.0h total over 2 shifts)"
         required: false
-        default: "4.0"
+        default: "4.5"
         type: string
       shifts_left:
         description: "Continuation shifts after this one (default 1 = up to 2 shifts / ~8h total; auto-disabled if hours < 1.0)"
@@ -52,7 +52,7 @@ jobs:
               "gauravdev833844-gif/py-task-repo4": "@bekalki|UC-JQRYHht4tLKpiChum6GnA",
               "gauravdev833844-gif/py-task-newrepo": "@HarshxTashu|UCIvzNxn_8Avi35lki-idQHg",
               "gauravdev833844-gif/yt-recorder": "@Realzeal.official|UCDxTnyiBjk-SI3ySaGjw9wA",
-              "h29257583-svg/py-task-pbrepo": "@_heyb7|UCiFH1EwIHWmPayYRuDGOHPA",
+              "h29257583-svg/py-task-pbrepo": "@HEYB69IRL|UCIj7XNPnTHQ8WRQVcDyfEiA",
               "johnwatson739418-lab/python-script-task": "@Apka-aashu|UCGFi8l9sf5ab4hVJf7byBZg",
               "johnwatson739418-lab/py-task-repoansh": "@anshhhlive_1|UC3NiNPo4kJYnYYhV_6ZnUGw",
               "h29257583-svg/script-py-reporish": "@rishnaaa4u|UCsda8YnhZU-aabHGLZcCIfw",
@@ -162,7 +162,7 @@ jobs:
       - name: Run Recorder
         env:
           TARGET_DATA: ${{ matrix.target }}
-          INPUT_HOURS: ${{ github.event.inputs.hours || '4.0' }}
+          INPUT_HOURS: ${{ github.event.inputs.hours || '4.5' }}
           INPUT_SHIFTS_LEFT: ${{ github.event.inputs.shifts_left || '1' }}
           INPUT_ALWAYS_CONTINUE: ${{ github.event.inputs.always_continue || 'true' }}
           INPUT_USE_COOKIES: ${{ github.event.inputs.use_cookies || 'false' }}
@@ -186,7 +186,7 @@ jobs:
           export CHANNEL_HANDLE=$(echo "$TARGET_DATA" | cut -d'|' -f1)
           export TARGET_CHANNEL_ID=$(echo "$TARGET_DATA" | cut -d'|' -f2)
           echo "CHANNEL_HANDLE=$CHANNEL_HANDLE" >> "$GITHUB_ENV"
-          export HOURS="${INPUT_HOURS:-4.0}"
+          export HOURS="${INPUT_HOURS:-4.5}"
           export OUT_DIR="./streams"
 
           # Disable auto-continuation on short tests (< 1.0 hour) so a 12-min @DWNews test doesn't spawn another run
@@ -432,7 +432,7 @@ jobs:
             UPLOAD_VERIFIED="false"
             if [ "$STATUS" == "ok" ]; then
               UPLOAD_LINK=$(echo "$RESP" | jq -r '.data.downloadPage // empty' 2>/dev/null || true)
-              FILE_ID=$(echo "$RESP" | jq -r '.data.fileId // empty' 2>/dev/null || true)
+              FILE_ID=$(echo "$RESP" | jq -r '.data.id // .data.fileId // .data.code // empty' 2>/dev/null || true)
               if [ -n "$UPLOAD_LINK" ] && [ -n "$FILE_ID" ]; then
                 UPLOAD_METHOD="Gofile"
                 UPLOAD_VERIFIED="true"
@@ -442,10 +442,12 @@ jobs:
                 echo "Download Link: $UPLOAD_LINK"
                 echo "=================================================="
               else
-                echo "- ⚠️ **UPLOAD_UNVERIFIED**: Gofile response missing fileId or downloadPage" >> "$GITHUB_STEP_SUMMARY"
+                echo "Gofile response missing downloadPage or ID, falling back to Google Drive..."
               fi
-            else
-              echo "Gofile upload did not succeed. Falling back to Google Drive..."
+            fi
+
+            if [ "$UPLOAD_VERIFIED" != "true" ]; then
+              echo "Gofile upload not verified. Falling back to Google Drive..."
 
               # 2) Fallback to Google Drive via rclone (strictly verified type = drive remote)
               if [ -n "$RCLONE_CONF" ] && [ -n "$DRIVE_REMOTE" ]; then
