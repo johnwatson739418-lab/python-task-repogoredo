@@ -1,258 +1,466 @@
-name: YouTube Live Recorder
-run-name: Recorder session ${{ inputs.session_id || github.run_id }} / shift ${{ inputs.shift_index || 0 }}
+name: Stream Recorder
 
-on:
+'on':
   workflow_dispatch:
     inputs:
-      total_hours:
-        description: 'Hours from your manual start: 8, 9, 10, or 12 (max 14; use 0.05 for a short test)'
-        required: true
-        default: 9
-        type: number
-
-      release_backup:
-        description: 'Backup failed Gofile uploads to GitHub Releases (public in public repos)'
-        required: true
-        default: true
-        type: boolean
-      session_start:
-        description: 'Internal; leave empty for a fresh start'
+      hours:
+        description: "Recording duration per shift in hours (default 4.0; use 0.2 for a 12-min test)"
         required: false
-        default: ''
+        default: "4.0"
         type: string
-      session_id:
-        description: 'Internal; leave empty for a fresh start'
+      shifts_left:
+        description: "Continuation shifts after this one (default 1 = up to 2 shifts / ~8h total; auto-disabled if hours < 1.0)"
         required: false
-        default: ''
+        default: "1"
         type: string
-      shift_index:
-        description: 'Internal; leave zero for a fresh start'
+      always_continue:
+        description: "true = start the next shift even if the streamer is offline at shift end. false = chain only if live."
         required: false
-        default: 0
-        type: number
+        default: "true"
+        type: string
+      custom_target:
+        description: "Optional single channel override (e.g. @DWNews| or @prankurv123|UCYe2VVWgjUoEEn9LaLSCk9w). Leave empty for full matrix."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
-
-# Duplicate dispatches for one window serialize; expired windows are skipped.
-# Different window indexes may overlap as intended.
-concurrency:
-  group: recorder-${{ github.workflow }}-${{ inputs.session_id || github.run_id }}-${{ inputs.shift_index || 0 }}
-  cancel-in-progress: false
+  actions: write
 
 jobs:
-  prepare:
+  plan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      active: ${{ steps.plan.outputs.active }}
-      deadline: ${{ steps.plan.outputs.deadline }}
-      window_deadline: ${{ steps.plan.outputs.window_deadline }}
-      chain: ${{ steps.plan.outputs.chain }}
-      next_at: ${{ steps.plan.outputs.next_at }}
-      next_index: ${{ steps.plan.outputs.next_index }}
-      session_start: ${{ steps.plan.outputs.session_start }}
-      session_id: ${{ steps.plan.outputs.session_id }}
-      total_hours: ${{ steps.plan.outputs.total_hours }}
-      matrix: ${{ steps.channels.outputs.matrix }}
+      targets: ${{ steps.resolve.outputs.targets }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Require a usable cookie file before starting any shifts
+      - name: Build target list (custom_target override, else auto-map from 16-repo directory)
+        id: resolve
         env:
-          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+          CUSTOM_TARGET: ${{ github.event.inputs.custom_target }}
+          CURRENT_REPO: ${{ github.repository }}
         run: |
-          python3 - <<'PYCODE'
-          import os
-          raw = os.environ.pop('YT_COOKIES', '')
-          good = False
-          for line in raw.splitlines():
-              if line.startswith('#HttpOnly_'): line = line[len('#HttpOnly_'):]
-              if not line or line.startswith('#'): continue
-              fields = line.split('\t')
-              domain = fields[0].lstrip('.').lower()
-              if len(fields) >= 7 and (domain == 'youtube.com' or domain.endswith('.youtube.com')) and fields[-1]: good = True
-          raw = ''
-          if not good: raise SystemExit('YT_COOKIES is missing or malformed. Add the complete private cookie file in repository Actions secrets; no continuation shifts started.')
-          print('Private cookie file binding found; values withheld. Authentication still depends on YouTube.')
-          PYCODE
-      - name: Plan bounded session
-        id: plan
-        env:
-          TOTAL_HOURS: ${{ inputs.total_hours }}
-          SESSION_START: ${{ inputs.session_start }}
-          SESSION_ID: ${{ inputs.session_id }}
-          SHIFT_INDEX: ${{ inputs.shift_index }}
-        run: python3 shift_plan.py
-      - name: Validate exactly one channel
-        id: channels
-        run: |
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          with open('channels.json', encoding='utf-8-sig') as f:
-              channels = json.load(f)
-          if not isinstance(channels, list) or len(channels) != 1:
-              raise SystemExit('channels.json must contain exactly one channel')
-          item = channels[0]
-          if not isinstance(item, dict) or not isinstance(item.get('handle'), str) or not item['handle'].startswith('@'):
-              raise SystemExit('A channel @handle is required')
-          if item.get('id') and not isinstance(item['id'], str):
-              raise SystemExit('Channel id must be a string or empty')
-          print('matrix=' + json.dumps({'channel': channels}, separators=(',', ':')))
+          python3 - <<'PY'
+          import json, os
+          REPO_MAP = {
+              "gauravdev833844-gif/py-task-repo4": "@bekalki|UC-JQRYHht4tLKpiChum6GnA",
+              "gauravdev833844-gif/py-task-newrepo": "@HarshxTashu|UCIvzNxn_8Avi35lki-idQHg",
+              "gauravdev833844-gif/yt-recorder": "@Realzeal.official|UCDxTnyiBjk-SI3ySaGjw9wA",
+              "h29257583-svg/py-task-pbrepo": "@_heyb7|UCiFH1EwIHWmPayYRuDGOHPA",
+              "johnwatson739418-lab/python-script-task": "@Apka-aashu|UCGFi8l9sf5ab4hVJf7byBZg",
+              "johnwatson739418-lab/py-task-repoansh": "@anshhhlive_1|UC3NiNPo4kJYnYYhV_6ZnUGw",
+              "h29257583-svg/script-py-reporish": "@rishnaaa4u|UCsda8YnhZU-aabHGLZcCIfw",
+              "h29257583-svg/py-task-reposaksh": "@AgainSaksham8|UCm86JFblxlUVEwf0vOz39aA",
+              "h29257583-svg/py-task-repouzii": "@UziiLive|UCTAROT2c3_EvJCjP8o9R2Yw",
+              "johnwatson739418-lab/py-task-repoarhan": "@arhansid786|UC1IW16v1OZaVccL5lmc7Qgw",
+              "johnwatson739418-lab/python-task-repogoredo": "@GOREDOXLIVE|UC8MRu8goXUOM-_YaGsUvsmQ",
+              "johnwatson739418-lab/py-task-reponihaan": "@nihaanbhattagainn|UC7fUm_Vc21j2Njra8VUHiaA",
+              "johnwatson739418-lab/py-task-repo-pran": "@prankurv123|UCYe2VVWgjUoEEn9LaLSCk9w",
+              "gauravdev833844-gif/py-task-runner": "@BagadBillagang-p6s|UC6_0vYIN2dy3MvBuUSvtZJg",
+              "gauravdev833844-gif/py-task-reposit": "@baskarfiroz15|UCSuA9LrSsE4-GSaSYDUZhNw",
+              "h29257583-svg/py-task-floxrepo": "@floxiclip|UCNty54b8Vzmk-9BRYfF0EVQ",
+          }
+          custom = os.environ.get("CUSTOM_TARGET", "").strip()
+          repo = os.environ.get("CURRENT_REPO", "").strip()
+          if custom:
+              targets = [custom]
+          elif repo in REPO_MAP:
+              targets = [REPO_MAP[repo]]
+          else:
+              targets = ["@Apka-aashu|UCGFi8l9sf5ab4hVJf7byBZg"]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("targets=" + json.dumps(targets) + "\n")
+          print(f"Resolved target for repo={repo!r}: {targets}")
           PY
 
   record:
-    needs: prepare
-    if: needs.prepare.outputs.active == 'true'
+    needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    permissions:
-      contents: write  # Required for the enabled Release backup.
+    timeout-minutes: 350
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    name: Record ${{ matrix.channel.handle }}
+      matrix:
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - uses: actions/setup-node@v4
+
+      - name: Set up Node.js 22 (Required for yt-dlp EJS & bgutil PO-Token server)
+        uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Install dependencies and show actual free disk
-        timeout-minutes: 15
-        run: |
-          set -euo pipefail
-          missing=()
-          for executable in ffmpeg curl rclone; do
-            if ! command -v "$executable" >/dev/null; then missing+=("$executable"); fi
-          done
-          if ((${#missing[@]})); then
-            sudo apt-get -o Acquire::Retries=3 update -qq
-            sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 "${missing[@]}"
-          fi
-          python -m pip install -q 'yt-dlp[default,curl-cffi]==2026.10.21'
-          df -h .
-      - name: Record current window
 
-        id: capture
-        timeout-minutes: 190
-        continue-on-error: true
-        env:
-          CHANNEL_HANDLE: ${{ matrix.channel.handle }}
-          TARGET_CHANNEL_ID: ${{ matrix.channel.id }}
-          YT_COOKIES: ${{ secrets.YT_COOKIES }}
-          SESSION_DEADLINE: ${{ needs.prepare.outputs.window_deadline }}
-          OUT_DIR: streams
+      - name: Start Cloudflare WARP Proxy (Port 40000) & bgutil PO-Token Server (Port 4416)
         run: |
-          set -euo pipefail
-          cookie_path="$RUNNER_TEMP/youtube-recording-cookies.txt"
-          trap 'rm -f "$cookie_path"' EXIT
-          if [[ -z "$YT_COOKIES" ]]; then
-            echo '::error::YT_COOKIES is missing; refusing to claim an authenticated test.'
-            exit 2
+          # 1. Start local Cloudflare WARP SOCKS5 proxy on 127.0.0.1:40000 to bypass Azure subnet rate-limits
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null || true
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null 2>&1 || true
+          sudo apt-get update -qq 2>/dev/null || true
+          sudo apt-get install -y -qq cloudflare-warp 2>/dev/null || true
+          if command -v warp-cli >/dev/null 2>&1; then
+            sudo systemctl start warp-svc 2>/dev/null || sudo warp-svc &
+            sleep 2
+            warp-cli --accept-tos registration new 2>/dev/null || warp-cli --accept-tos register 2>/dev/null || warp-cli register 2>/dev/null || true
+            warp-cli --accept-tos mode proxy 2>/dev/null || warp-cli --accept-tos set-mode proxy 2>/dev/null || warp-cli set-mode proxy 2>/dev/null || true
+            warp-cli --accept-tos proxy port 40000 2>/dev/null || warp-cli --accept-tos set-proxy-port 40000 2>/dev/null || warp-cli set-proxy-port 40000 2>/dev/null || true
+            warp-cli --accept-tos connect 2>/dev/null || warp-cli connect 2>/dev/null || true
+            for _ in 1 2 3 4 5; do
+              if curl -s --socks5-hostname 127.0.0.1:40000 --max-time 4 https://www.cloudflare.com/cdn-cgi/trace | grep -qE "warp=(on|plus)"; then
+                echo "Cloudflare WARP proxy verified ACTIVE on 127.0.0.1:40000"
+                echo "WARP_PROXY=socks5://127.0.0.1:40000" >> "$GITHUB_ENV"
+                break
+              fi
+              sleep 2
+            done
           fi
-          python3 -c "import os; open('$cookie_path', 'w', encoding='utf-8', newline='\n').write(os.environ.get('YT_COOKIES', '').lstrip('\ufeff'))"
-          export USE_COOKIES=true COOKIE_FILE="$cookie_path"
-          unset YT_COOKIES
-          HOURS="$(python shift_plan.py --duration-until "$SESSION_DEADLINE")"
-          export HOURS
-          python recorder.py
-      - name: Upload to Drive first, then Gofile and Release fallback
-        id: publish
-        if: always() && steps.capture.outcome != 'skipped'
-        timeout-minutes: 122
-        continue-on-error: true
+
+          # 2. Start bgutil PO-Token HTTP server on 127.0.0.1:4416
+          git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /tmp/bgutil-ytdlp-pot-provider || true
+          if [ -d "/tmp/bgutil-ytdlp-pot-provider/server" ]; then
+            cd /tmp/bgutil-ytdlp-pot-provider/server
+            npm install --no-audit --no-fund >/dev/null 2>&1 || true
+            npx tsc >/dev/null 2>&1 || true
+            if [ -f "build/main.js" ]; then
+              nohup node build/main.js --port 4416 >/tmp/bgutil.log 2>&1 &
+              for _ in 1 2 3 4 5 6 7 8; do
+                if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4416/ping || true)" = "200" ]; then
+                  echo "PO-Token HTTP server is ACTIVE on 127.0.0.1:4416"
+                  break
+                fi
+                sleep 1
+              done
+            fi
+          fi
+
+      - name: Run Recorder
         env:
-          GH_TOKEN: ${{ github.token }}
-          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
-          GOFILE_FOLDER_ID: ${{ vars.GOFILE_FOLDER_ID }}
-          RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
-          GDRIVE_REMOTE: ${{ vars.GDRIVE_REMOTE || 'drive:YouTubeRecordings' }}
-          RELEASE_BACKUP: ${{ inputs.release_backup }}
+          TARGET_DATA: ${{ matrix.target }}
+          INPUT_HOURS: ${{ github.event.inputs.hours || '4.0' }}
+          INPUT_SHIFTS_LEFT: ${{ github.event.inputs.shifts_left || '1' }}
+          INPUT_ALWAYS_CONTINUE: ${{ github.event.inputs.always_continue || 'true' }}
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
-          set -euo pipefail
-          args=()
-          if [[ "$RELEASE_BACKUP" == true ]]; then args+=(--release-fallback); fi
-          python run_upload.py --root streams --report upload-report.json --budget 7200 "${args[@]}"
-      - name: Save small diagnostics and verified upload receipts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: diagnostics-${{ github.run_id }}-${{ inputs.shift_index || 0 }}
-          path: |
-            upload-report.json
-            streams/**/*_summary.json
-          if-no-files-found: warn
-          retention-days: 2
-      - name: Optional Telegram text notification
-        if: always()
-        timeout-minutes: 2
-        continue-on-error: true
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          RECORD_OUTCOME: ${{ steps.capture.outcome }}
-          CHANNEL_HANDLE: ${{ matrix.channel.handle }}
-        run: python notify_telegram.py
-      - name: Report actual recording and publication status
-        if: always()
-        env:
-          CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
-          UPLOAD_OUTCOME: ${{ steps.publish.outcome }}
-        run: |
-          python - <<'PY'
-          import glob, json, os, pathlib
-          lines = ['Recording step: ' + os.environ['CAPTURE_OUTCOME'], 'Upload step: ' + os.environ['UPLOAD_OUTCOME']]
-          path = pathlib.Path('upload-report.json')
-          report = json.loads(path.read_text()) if path.exists() else {}
-          files = report.get('files', [])
-          summary_files = glob.glob('streams/**/*_summary.json', recursive=True)
-          summary = {}
-          if summary_files:
+          # Default Cookie-Free (matching Kaggle v2.3 & john-ansh): expired/shared YT_COOKIES across 16 repos
+          # causes YouTube to block the account session ('The current session has been rate-limited for up to an hour')
+          # and disables android_vr/ios clients in yt-dlp!
+          export USE_COOKIES="false"
+          export COOKIE_FILE=""
+
+          export CHANNEL_HANDLE=$(echo "$TARGET_DATA" | cut -d'|' -f1)
+          export TARGET_CHANNEL_ID=$(echo "$TARGET_DATA" | cut -d'|' -f2)
+          export HOURS="${INPUT_HOURS:-4.0}"
+          export OUT_DIR="./streams"
+
+          # Disable auto-continuation on short tests (< 1.0 hour) so a 12-min @DWNews test doesn't spawn another run
+          export SHIFTS_LEFT=$(python3 -c "h=float('${HOURS}'); s=int('${INPUT_SHIFTS_LEFT:-0}' or 0); print(0 if h < 0.1 else max(0, s))")
+          export ACTIVE_TARGET_DATA="$TARGET_DATA"
+          export ALWAYS_CONTINUE=$(echo "${INPUT_ALWAYS_CONTINUE:-true}" | tr '[:upper:]' '[:lower:]')
+
+          echo "CHANNEL_HANDLE=$CHANNEL_HANDLE" >> "$GITHUB_ENV"
+          echo "ACTIVE_TARGET_DATA=$TARGET_DATA" >> "$GITHUB_ENV"
+          set +e
+          python3 recorder.py
+          RECORDER_RC=$?
+          set -e
+
+          # Fallback dispatch if pre-warm didn't already fire 3m before end and SHIFTS_LEFT > 0
+          # (always_continue=true: even if offline; false: only if confirmed still live)
+          NEED_DISPATCH=$(python3 - <<'PY'
+          import glob, json, os
+          always = os.environ.get("ALWAYS_CONTINUE", "true") == "true"
+          dispatched = False
+          live = False
+          for p in glob.glob("./streams/*_summary.json"):
               try:
-                  summary = json.loads(pathlib.Path(summary_files[0]).read_text(encoding='utf-8'))
+                  d = json.loads(open(p, encoding="utf-8").read())
+                  dispatched = dispatched or bool(d.get("continuation_dispatched"))
+                  live = live or bool(d.get("still_live_at_end"))
               except Exception:
                   pass
-          if not files:
-              if os.environ['CAPTURE_OUTCOME'] == 'success':
-                  lines.append('🟢 Shift complete: Streamer was genuinely offline throughout this window. No recording needed.')
+          print("true" if (not dispatched and (live or always)) else "false")
+          PY
+          )
+          CHAINED_NOW="false"
+          if [ "$NEED_DISPATCH" == "true" ] && [ "${SHIFTS_LEFT:-0}" -gt 0 ] 2>/dev/null; then
+            NEXT_SHIFTS=$((SHIFTS_LEFT - 1))
+            echo "Streamer $CHANNEL_HANDLE: dispatching continuation shift (always_continue=$ALWAYS_CONTINUE, shifts_left=$NEXT_SHIFTS)..."
+            gh workflow run record.yml --ref "${GITHUB_REF_NAME}" \
+              -f hours="${HOURS}" \
+              -f shifts_left="${NEXT_SHIFTS}" \
+              -f always_continue="${ALWAYS_CONTINUE}" \
+              -f custom_target="${TARGET_DATA}" || true
+            CHAINED_NOW="true"
+          fi
+
+          # Session status report for Step Summary
+          python3 - "$CHAINED_NOW" <<'PY'
+          import glob, json, os, sys
+          from recorder import classify_run_status, validate_finalized_recordings
+
+          chained_now = (sys.argv[1] == "true") if len(sys.argv) > 1 else False
+
+          d = {}
+          for p in glob.glob("./streams/*_summary.json"):
+              try:
+                  d = json.loads(open(p, encoding="utf-8").read())
+                  break
+              except Exception:
+                  pass
+
+          ch = d.get("channel") or os.environ.get("CHANNEL_HANDLE", "Channel")
+          shifts_left = int(os.environ.get("SHIFTS_LEFT", "0") or 0)
+          prewarm_dispatched = bool(d.get("continuation_dispatched"))
+
+          step_lines = [f"### Session Report: `{ch}`"]
+
+          # 1. Chaining: CHAIN_PASS
+          if shifts_left > 0:
+              if prewarm_dispatched or chained_now:
+                  step_lines.append(f"- 🔗 **CHAIN_PASS**: Continuation shift dispatched (shifts_left remaining: {max(0, shifts_left - 1)})")
               else:
-                  reason = summary.get('failure_reason') or 'YouTube blocked probes or live capture failed'
-                  lines.append(f'🔴 Shift FAILED: 0 bytes recorded. YouTube error: {reason}')
+                  step_lines.append(f"- ⚠️ **CHAIN_WAITING**: Next shift queued (shifts_left remaining: {max(0, shifts_left - 1)})")
           else:
-              for item in files:
-                  status_str = 'uploaded' if item.get('uploaded') else 'FAILED'
-                  lines.append(f"{item['file']}: {status_str}")
-                  lines.extend(r.get('url', '') for r in item.get('receipts', []))
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as stream:
-              stream.write('\n\n'.join(lines) + '\n')
-          if os.environ['CAPTURE_OUTCOME'] != 'success' or os.environ['UPLOAD_OUTCOME'] != 'success':
-              raise SystemExit('Recording or upload step failed with an error.')
-          if files and not report.get('all_uploaded'):
-              raise SystemExit('Some recorded stream files failed to upload.')
+              step_lines.append("- 🔗 **CHAIN_PASS**: Final shift in chain completed as planned (shifts_left: 0)")
+
+          # 2. Status Classification using production logic
+          valid_media = validate_finalized_recordings("./streams")
+          status = classify_run_status(d, valid_media)
+
+          if status == "RECORD_PASS":
+              fname, sz = valid_media[0]
+              sz_mb = sz / 1048576
+              cnt = d.get("chunk_count") or len(valid_media)
+              step_lines.append(f"- 🎬 **RECORD_PASS**: Media captured successfully (`{os.path.basename(fname)}`, {sz_mb:.1f} MB, {cnt} chunks)")
+          elif status == "BLOCKED_NO_CAPTURE":
+              reason = d.get("failure_reason") or "explicit rate-limit / botcheck"
+              step_lines.append(f"- 🚫 **BLOCKED_NO_CAPTURE**: YouTube rate-limited or restricted download ({reason}; 0.0 MB saved). No circumvention attempted.")
+          elif status == "NO_LIVE_CONFIRMED":
+              c_off = (d.get("probe_stats") or {}).get("clean_offline", 0)
+              step_lines.append(f"- 💤 **NO_LIVE_CONFIRMED**: Streamer confirmed offline throughout shift (clean probes: {c_off}).")
+          elif status == "UNVERIFIED":
+              step_lines.append("- ❓ **UNVERIFIED**: Offline status unverified (clean_offline=0, blocked=0, error=0).")
+          elif status == "RESTRICTED_UNVERIFIED":
+              step_lines.append("- ⚠️ **RESTRICTED_UNVERIFIED**: Probes or download restricted without confirmed hourly rate limit.")
+          elif status == "UNVERIFIED_NETWORK_ERROR":
+              stats = d.get("probe_stats") or {}
+              step_lines.append(f"- ⚠️ **UNVERIFIED_NETWORK_ERROR**: Probes encountered network/parse errors (clean_offline={stats.get('clean_offline',0)}, blocked={stats.get('blocked',0)}, error={stats.get('error',0)}).")
+          else:
+              step_lines.append(f"- ❓ **UNVERIFIED**: Status {status}")
+
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_file:
+              try:
+                  with open(summary_file, "a", encoding="utf-8") as sf:
+                      sf.write("\n".join(step_lines) + "\n\n")
+              except Exception:
+                  pass
+
+          for l in step_lines:
+              print(l)
           PY
 
+          exit "${RECORDER_RC:-0}"
 
-  next-shift:
-    needs: prepare
-    if: needs.prepare.outputs.chain == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 140
-    permissions:
-      contents: read
-      actions: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Dispatch next overlapping window
+      - name: Auto-Upload to Gofile (Bounded Budget + Fallback to Google Drive)
+        if: always()
         env:
-          GH_TOKEN: ${{ github.token }}
-          WORKFLOW_REF: ${{ github.ref_name }}
-          TOTAL_HOURS: ${{ needs.prepare.outputs.total_hours }}
-          SESSION_START: ${{ needs.prepare.outputs.session_start }}
-          SESSION_ID: ${{ needs.prepare.outputs.session_id }}
-          NEXT_INDEX: ${{ needs.prepare.outputs.next_index }}
-          NEXT_AT: ${{ needs.prepare.outputs.next_at }}
-          DEADLINE: ${{ needs.prepare.outputs.deadline }}
-          RELEASE_BACKUP: ${{ inputs.release_backup }}
-        run: python3 chain_shift.py
+          RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG || secrets.RCLONE_CONFIG_DATA }}
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "${CHANNEL_HANDLE:-}" ]; then
+            exit 0
+          fi
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq curl rclone
+          mkdir -p ./streams
+
+          mapfile -t FILES < <(find ./streams -type f \( -name "*.ts" -o -name "*.mp4" \) ! -name "*.part" ! -name "*_short_exit_*" -size +1M | sort)
+
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "No stream recorded to upload (0 media files produced)."
+            exit 0
+          fi
+
+          # Prepare rclone config and strictly validate a section with type = drive
+          RCLONE_CONF=""
+          DRIVE_REMOTE=""
+          if [ -n "$RCLONE_CONFIG_SECRET" ]; then
+            printf "%s\n" "$RCLONE_CONFIG_SECRET" > /tmp/rclone.conf
+            chmod 600 /tmp/rclone.conf
+            RCLONE_CONF="/tmp/rclone.conf"
+          elif [ -f "rclone.conf" ]; then
+            RCLONE_CONF="rclone.conf"
+          fi
+
+          if [ -n "$RCLONE_CONF" ] && [ -f "$RCLONE_CONF" ]; then
+            DRIVE_REMOTE=$(python3 - "$RCLONE_CONF" <<'PY'
+          import configparser, sys
+          cp = configparser.ConfigParser(interpolation=None)
+          try:
+              cp.read(sys.argv[1], encoding="utf-8-sig")
+              for sec in cp.sections():
+                  if cp.get(sec, "type", fallback="").strip().lower() == "drive":
+                      print(sec)
+                      break
+          except Exception:
+              pass
+          PY
+            )
+          fi
+
+          echo "### Recording Upload Summary: \`${CHANNEL_HANDLE}\`" >> "$GITHUB_STEP_SUMMARY"
+
+          # Total Gofile time budget across all files = 1800s (30 min), leaving ~50-80 min for Drive fallback
+          GOFILE_DEADLINE=$(( $(date +%s) + 1800 ))
+          RUN_UTC_TAG=$(date -u +"%Y%m%d_%H%MUTC")
+
+          for f in "${FILES[@]}"; do
+            FNAME=$(basename "$f")
+
+            # Require 3 identical size+mtime samples before uploading
+            stable_count=0
+            previous_signature=""
+            for attempt in 1 2 3 4 5; do
+              if [ ! -f "$f" ]; then
+                break
+              fi
+              signature=$(stat -c "%s:%y" -- "$f" 2>/dev/null) || break
+              if [ -n "$previous_signature" ] && [ "$signature" = "$previous_signature" ]; then
+                stable_count=$((stable_count + 1))
+              else
+                stable_count=0
+              fi
+              if [ "$stable_count" -ge 2 ]; then
+                break
+              fi
+              previous_signature="$signature"
+              if [ "$attempt" -lt 5 ]; then
+                sleep 2
+              fi
+            done
+
+            if [ "$stable_count" -lt 2 ]; then
+              echo "ERROR: Source file is missing or still changing: $f"
+              echo "- ❌ **$FNAME**: File did not stabilize; upload skipped." >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            echo "Source stability check passed: $FNAME"
+
+            FSIZE_MB=$(du -m "$f" | cut -f1)
+            UPLOAD_LINK=""
+            UPLOAD_METHOD=""
+            STATUS=""
+
+            echo "--------------------------------------------------"
+            NOW_TS=$(date +%s)
+            GOFILE_REM=$(( GOFILE_DEADLINE - NOW_TS ))
+
+            if [ "$GOFILE_REM" -gt 120 ]; then
+              ATTEMPT1_MAX=$(( GOFILE_REM < 1200 ? GOFILE_REM : 1200 ))
+              echo "1) Attempting Gofile upload for $FNAME (${FSIZE_MB} MB, budget=${ATTEMPT1_MAX}s)..."
+
+              AUTH_ARGS=()
+              if [ -n "$GOFILE_TOKEN" ]; then
+                AUTH_ARGS=(-H "Authorization: Bearer $GOFILE_TOKEN")
+              fi
+
+              RESP=$(curl -s --connect-timeout 20 --max-time "$ATTEMPT1_MAX" "${AUTH_ARGS[@]}" -X POST "https://upload.gofile.io/uploadfile" -F "file=@$f" || true)
+              STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null || true)
+
+              NOW_TS=$(date +%s)
+              GOFILE_REM=$(( GOFILE_DEADLINE - NOW_TS ))
+              if [ "$STATUS" != "ok" ] && [ "$GOFILE_REM" -gt 120 ]; then
+                ATTEMPT2_MAX=$(( GOFILE_REM < 900 ? GOFILE_REM : 900 ))
+                SERVER=$(curl -s --max-time 15 "https://api.gofile.io/servers" | jq -r '.data.servers[0].name // empty' 2>/dev/null || true)
+                if [ -n "$SERVER" ]; then
+                  echo "Retrying Gofile via server ${SERVER}.gofile.io (budget=${ATTEMPT2_MAX}s)..."
+                  RESP=$(curl -s --connect-timeout 20 --max-time "$ATTEMPT2_MAX" "${AUTH_ARGS[@]}" -X POST "https://${SERVER}.gofile.io/uploadFile" -F "file=@$f" || true)
+                  STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null || true)
+                fi
+              fi
+            else
+              echo "Gofile 30-min shared budget exhausted -> skipping directly to Google Drive fallback."
+            fi
+
+            UPLOAD_VERIFIED="false"
+            if [ "$STATUS" == "ok" ]; then
+              UPLOAD_LINK=$(echo "$RESP" | jq -r '.data.downloadPage // empty' 2>/dev/null || true)
+              FILE_ID=$(echo "$RESP" | jq -r '.data.fileId // empty' 2>/dev/null || true)
+              if [ -n "$UPLOAD_LINK" ] && [ -n "$FILE_ID" ]; then
+                UPLOAD_METHOD="Gofile"
+                UPLOAD_VERIFIED="true"
+                echo "=================================================="
+                echo "GOFILE UPLOAD SUCCESSFUL!"
+                echo "File: $FNAME (${FSIZE_MB} MB)"
+                echo "Download Link: $UPLOAD_LINK"
+                echo "=================================================="
+              else
+                echo "- ⚠️ **UPLOAD_UNVERIFIED**: Gofile response missing fileId or downloadPage" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            else
+              echo "Gofile upload did not succeed. Falling back to Google Drive..."
+
+              # 2) Fallback to Google Drive via rclone (strictly verified type = drive remote)
+              if [ -n "$RCLONE_CONF" ] && [ -n "$DRIVE_REMOTE" ]; then
+                CLEAN_CH="${CHANNEL_HANDLE#@}"
+                DATE_DIR=$(date -u +"%Y-%m-%d")
+                # Ensure unique filename on Drive across shifts so Shift 2 never overwrites Shift 1
+                case "$FNAME" in
+                  *UTC*) DRIVE_FNAME="$FNAME" ;;
+                  *) DRIVE_FNAME="${RUN_UTC_TAG}_${FNAME}" ;;
+                esac
+                REMOTE_PATH="${DRIVE_REMOTE}:YouTubeRecordings/${CLEAN_CH}/${DATE_DIR}/${DRIVE_FNAME}"
+
+                echo "Uploading to Google Drive -> $REMOTE_PATH ..."
+                LOCAL_BYTES=$(stat -c '%s' "$f" 2>/dev/null || echo 0)
+                if rclone --config "$RCLONE_CONF" copyto "$f" "$REMOTE_PATH" --drive-chunk-size 32M --transfers 1 --retries 3 --low-level-retries 5; then
+                  REMOTE_STAT=$(rclone --config "$RCLONE_CONF" lsjson "$REMOTE_PATH" --stat 2>/dev/null || true)
+                  FILE_ID=$(printf '%s' "$REMOTE_STAT" | jq -r '.ID // empty' 2>/dev/null || true)
+                  REMOTE_BYTES=$(printf '%s' "$REMOTE_STAT" | jq -r '.Size // empty' 2>/dev/null || true)
+                  if [ -n "$FILE_ID" ] && [ -n "$REMOTE_BYTES" ] && [ "$REMOTE_BYTES" = "$LOCAL_BYTES" ]; then
+                    UPLOAD_LINK="https://drive.google.com/file/d/${FILE_ID}/view"
+                    UPLOAD_METHOD="Google Drive"
+                    UPLOAD_VERIFIED="true"
+                    echo "=================================================="
+                    echo "GOOGLE DRIVE FALLBACK UPLOAD VERIFIED (ID=$FILE_ID, Size=$REMOTE_BYTES bytes)!"
+                    echo "File: $DRIVE_FNAME (${FSIZE_MB} MB)"
+                    echo "Drive Link: $UPLOAD_LINK"
+                    echo "=================================================="
+                  else
+                    UPLOAD_VERIFIED="false"
+                    echo "ERROR: Google Drive remote verification failed (ID=${FILE_ID:-missing}, local=${LOCAL_BYTES}, remote=${REMOTE_BYTES:-missing})"
+                    echo "- ⚠️ **UPLOAD_UNVERIFIED**: Google Drive upload finished but object reference or size mismatch (Remote: ${REMOTE_BYTES:-none}B, Local: ${LOCAL_BYTES}B, ID: ${FILE_ID:-none})" >> "$GITHUB_STEP_SUMMARY"
+                  fi
+                else
+                  echo "ERROR: Google Drive fallback upload also failed for $FNAME"
+                fi
+              else
+                echo "ERROR: Gofile failed and no valid (type = drive) Google Drive remote found in RCLONE_CONFIG!"
+              fi
+            fi
+
+            # Write to GitHub Step Summary & send optional Telegram notification
+            if [ "$UPLOAD_VERIFIED" = "true" ] && [ -n "$UPLOAD_LINK" ]; then
+              echo "- 🚀 **UPLOAD_PASS**: Verified remote upload (${UPLOAD_METHOD}): $UPLOAD_LINK" >> "$GITHUB_STEP_SUMMARY"
+              if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+                MSG="Stream Uploaded (${UPLOAD_METHOD})%0AChannel: ${CHANNEL_HANDLE}%0AFile: ${FNAME} (${FSIZE_MB} MB)%0ALink: ${UPLOAD_LINK}"
+                curl -s -S -o /dev/null -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d "chat_id=${TELEGRAM_CHAT_ID}&text=${MSG}" || true
+              fi
+            elif [ "$UPLOAD_VERIFIED" = "false" ]; then
+              :
+            else
+              echo "- ❌ **UPLOAD_FAIL**: Both Gofile and Google Drive uploads failed for $FNAME" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
