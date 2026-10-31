@@ -222,11 +222,19 @@ jobs:
           if [ "$NEED_DISPATCH" == "true" ] && [ "${SHIFTS_LEFT:-0}" -gt 0 ] 2>/dev/null; then
             NEXT_SHIFTS=$((SHIFTS_LEFT - 1))
             echo "Streamer $CHANNEL_HANDLE: dispatching continuation shift (always_continue=$ALWAYS_CONTINUE, shifts_left=$NEXT_SHIFTS)..."
-            gh workflow run record.yml --ref "${GITHUB_REF_NAME}" \
+            if ! gh workflow run record.yml --ref "${GITHUB_REF_NAME}" \
               -f hours="${HOURS}" \
               -f shifts_left="${NEXT_SHIFTS}" \
               -f always_continue="${ALWAYS_CONTINUE}" \
-              -f custom_target="${TARGET_DATA}" || true
+              -f use_cookies="${USE_COOKIES}" \
+              -f custom_target="${TARGET_DATA}" 2>/dev/null; then
+              GH_TOKEN="${GH_FALLBACK_TOKEN:-$GH_TOKEN}" gh workflow run record.yml --ref "${GITHUB_REF_NAME}" \
+                -f hours="${HOURS}" \
+                -f shifts_left="${NEXT_SHIFTS}" \
+                -f always_continue="${ALWAYS_CONTINUE}" \
+                -f use_cookies="${USE_COOKIES}" \
+                -f custom_target="${TARGET_DATA}" || true
+            fi
             CHAINED_NOW="true"
           fi
 
@@ -421,7 +429,7 @@ jobs:
                 SERVER=$(curl -s --max-time 15 "https://api.gofile.io/servers" | jq -r '.data.servers[0].name // empty' 2>/dev/null || true)
                 if [ -n "$SERVER" ]; then
                   echo "Retrying Gofile via server ${SERVER}.gofile.io (budget=${ATTEMPT2_MAX}s)..."
-                  RESP=$(curl -s --connect-timeout 20 --max-time "$ATTEMPT2_MAX" "${AUTH_ARGS[@]}" -X POST "https://${SERVER}.gofile.io/uploadFile" -F "file=@$f" || true)
+                  RESP=$(curl -s --connect-timeout 20 --max-time "$ATTEMPT2_MAX" "${AUTH_ARGS[@]}" -X POST "https://${SERVER}.gofile.io/contents/uploadfile" -F "file=@$f" || true)
                   STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null || true)
                 fi
               fi
@@ -433,6 +441,12 @@ jobs:
             if [ "$STATUS" == "ok" ]; then
               UPLOAD_LINK=$(echo "$RESP" | jq -r '.data.downloadPage // empty' 2>/dev/null || true)
               FILE_ID=$(echo "$RESP" | jq -r '.data.id // .data.fileId // .data.code // empty' 2>/dev/null || true)
+              if [ -n "$UPLOAD_LINK" ]; then
+                echo "Gofile Download Page returned: $UPLOAD_LINK"
+                if [ -z "$FILE_ID" ]; then
+                  FILE_ID="${UPLOAD_LINK##*/}"
+                fi
+              fi
               if [ -n "$UPLOAD_LINK" ] && [ -n "$FILE_ID" ]; then
                 UPLOAD_METHOD="Gofile"
                 UPLOAD_VERIFIED="true"

@@ -1,5 +1,5 @@
 """
-YouTube Live Recorder -- Cloud Runner Engine (v8.8)
+YouTube Live Recorder -- Cloud Runner Engine (v9.0 Production Edition)
 
 Builds on v8.7. Changes in v8.8:
  1. probe_fast() now checks /live, channel home AND /streams in parallel (3 workers),
@@ -766,12 +766,14 @@ def _exec_ytdlp_json(url, client, use_proxy=False):
         "--skip-download", "--no-warnings", "--ignore-no-formats-error",
         "--force-ipv4", "--playlist-items", "1",
     ] + JS_ARGS + build_extractor_args(client, skip_webpage=False) + impersonate_args(client)
+    ffmpeg_in_args = "-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 10"
     if use_proxy:
         proxy = effective_proxy_url()
         if proxy:
             command += ["--proxy", proxy]
             if proxy.startswith("http://"):
-                command += ["--downloader-args", f"ffmpeg:-http_proxy {proxy}"]
+                ffmpeg_in_args = f"-http_proxy {proxy} " + ffmpeg_in_args
+    command += ["--downloader-args", f"ffmpeg_i:{ffmpeg_in_args}"]
     if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE) and client not in COOKIE_INCOMPATIBLE_CLIENTS:
         command += ["--cookies", COOKIE_FILE]
     command.append(url)
@@ -1530,12 +1532,14 @@ def make_download_cmd(active, chunk_path, client, skip_webpage=True, use_proxy=F
     ] + JS_ARGS
 
     command += impersonate_args(client)
+    ffmpeg_in_args = "-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 10"
     if use_proxy:
         proxy = effective_proxy_url()
         if proxy:
             command += ["--proxy", proxy]
             if proxy.startswith("http://"):
-                command += ["--downloader-args", f"ffmpeg:-http_proxy {proxy}"]
+                ffmpeg_in_args = f"-http_proxy {proxy} " + ffmpeg_in_args
+    command += ["--downloader-args", f"ffmpeg_i:{ffmpeg_in_args}"]
     command += build_extractor_args(client, skip_webpage=skip_webpage)
     if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE) and client not in COOKIE_INCOMPATIBLE_CLIENTS:
         command += ["--cookies", COOKIE_FILE]
