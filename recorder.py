@@ -1,5 +1,5 @@
 """
-YouTube Live Recorder -- Cloud Runner Engine (v9.0 Production Edition)
+YouTube Live Recorder -- Cloud Runner Engine (v9.1 Auto-Cookie Fallback Edition)
 
 Builds on v8.7. Changes in v8.8:
  1. probe_fast() now checks /live, channel home AND /streams in parallel (3 workers),
@@ -63,6 +63,19 @@ USE_COOKIES = (
     and os.path.isfile(COOKIE_FILE)
     and os.path.getsize(COOKIE_FILE) > 20
 )
+FALLBACK_COOKIE_FILE = os.getenv("FALLBACK_COOKIE_FILE", "/tmp/fallback_cookies.txt").strip()
+if FALLBACK_COOKIE_FILE and not os.path.isfile(FALLBACK_COOKIE_FILE) and os.getenv("YT_COOKIES", "").strip():
+    try:
+        raw_fb = os.getenv("YT_COOKIES", "").lstrip("\ufeff")
+        if len(raw_fb.strip()) > 20:
+            with open(FALLBACK_COOKIE_FILE, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(raw_fb.strip() + "\n")
+    except Exception:
+        pass
+
+
+def has_fallback_cookies():
+    return bool(FALLBACK_COOKIE_FILE) and os.path.isfile(FALLBACK_COOKIE_FILE) and os.path.getsize(FALLBACK_COOKIE_FILE) > 20
 
 FORMAT_SELECTOR = (
     "b[height=720][protocol*=m3u8]"
@@ -220,7 +233,14 @@ RATE_LIMIT_MARKERS = [
 # Client-specific / temporary YouTube-side error. Switch client first; only treat as an IP block
 # if it keeps happening across several different clients (see record_until_stop).
 TRANSIENT_MARKERS = ["experiencing technical difficulties"]
-ACCESS_RESTRICTED_MARKERS = ["http error 403", "try again later", "this content isn't available"]
+ACCESS_RESTRICTED_MARKERS = [
+    "http error 403",
+    "403 forbidden",
+    "server returned 403",
+    "ffmpeg exited with code 183",
+    "try again later",
+    "this content isn't available",
+]
 NOT_LIVE_MARKERS = [
     "the channel is not currently live",
     "this live event will begin",
@@ -760,32 +780,33 @@ def inspect_youtube_html(html):
 # yt-dlp JSON probe
 # --------------------------------------------------------------------------------------
 
-def _exec_ytdlp_json(url, client, use_proxy=False):
+def _exec_ytdlp_json(url, client, use_proxy=False, force_cookie=False):
+    skip_wp = (client in SKIP_WEBPAGE_CLIENTS) and ("/watch?v=" in str(url))
     command = [
         sys.executable, "-m", "yt_dlp", "--no-config", "-J",
         "--skip-download", "--no-warnings", "--ignore-no-formats-error",
         "--force-ipv4", "--playlist-items", "1",
-    ] + JS_ARGS + build_extractor_args(client, skip_webpage=False) + impersonate_args(client)
-    ffmpeg_in_args = "-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 10"
+    ] + JS_ARGS + build_extractor_args(client, skip_webpage=skip_wp) + impersonate_args(client)
     if use_proxy:
         proxy = effective_proxy_url()
         if proxy:
             command += ["--proxy", proxy]
-            if proxy.startswith("http://"):
-                ffmpeg_in_args = f"-http_proxy {proxy} " + ffmpeg_in_args
-    command += ["--downloader-args", f"ffmpeg_i:{ffmpeg_in_args}"]
-    if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE) and client not in COOKIE_INCOMPATIBLE_CLIENTS:
-        command += ["--cookies", COOKIE_FILE]
+    if client not in COOKIE_INCOMPATIBLE_CLIENTS:
+        if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE):
+            command += ["--cookies", COOKIE_FILE]
+        elif force_cookie and has_fallback_cookies():
+            command += ["--cookies", FALLBACK_COOKIE_FILE]
     command.append(url)
     return subprocess.run(command, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=PROBE_TIMEOUT_SECONDS)
 
 
-def run_ytdlp_json(url, client):
+def run_ytdlp_json(url, client, force_cookie=False):
     global YTDLP_PROBE_COOLDOWN_UNTIL
     routes = route_order()
     for idx, use_proxy in enumerate(routes):
         try:
-            result = _exec_ytdlp_json(url, client, use_proxy=use_proxy)
+            extra = {"force_cookie": True} if force_cookie else {}
+            result = _exec_ytdlp_json(url, client, use_proxy=use_proxy, **extra)
             if result.returncode == 0 and result.stdout.strip():
                 raw = json.loads(result.stdout)
                 if raw.get("_type") == "playlist" and raw.get("entries"):
@@ -803,7 +824,7 @@ def run_ytdlp_json(url, client):
                 YTDLP_PROBE_COOLDOWN_UNTIL = time.time() + 180
                 PROBE_STATS["blocked"] += 1
                 write_summary(blocked_by_youtube=True, probe_stats=PROBE_STATS)
-                log(f"ytdlp_probe_blocked | client={client_label(client)} | cooling down yt-dlp probes for 180s")
+                log(f"ytdlp_probe_blocked | client={client_label(client)} | cookie={force_cookie or USE_COOKIES} | cooling down yt-dlp probes for 180s")
         except Exception:
             pass
     return None
@@ -820,6 +841,11 @@ def extract_live_badge_ids(html):
     state, strict_details = inspect_youtube_html(html)
     if state == "LIVE" and strict_details and strict_details.get("videoId"):
         scores[strict_details["videoId"]] = 40
+    # Even if /live redirected to a watch page that triggered a botcheck wall, its canonical watch?v=ID is in <head>!
+    for canon_m in re.finditer(r'<link\s+rel="canonical"\s+href="https://www\.youtube\.com/watch\?v=([A-Za-z0-9_-]{11})"', html):
+        vid = canon_m.group(1)
+        if vid not in NON_LIVE_VOD_CACHE:
+            scores[vid] = max(scores.get(vid, 0), 25)
 
     patterns = [r'"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"', r'watch\?v=([A-Za-z0-9_-]{11})', r'shorts/([A-Za-z0-9_-]{11})']
     for pattern in patterns:
@@ -847,9 +873,10 @@ def extract_rss_video_ids(xml):
     return [vid for vid in re.findall(r"<yt:videoId>([A-Za-z0-9_-]{11})</yt:videoId>", xml)[:3] if vid not in NON_LIVE_VOD_CACHE]
 
 
-def validate_candidate(video_id, client):
+def validate_candidate(video_id, client, force_cookie=False):
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
-    info = run_ytdlp_json(watch_url, client)
+    extra = {"force_cookie": True} if force_cookie else {}
+    info = run_ytdlp_json(watch_url, client, **extra)
     if not info:
         return None
     live_status = str(info.get("live_status") or "").casefold()
@@ -903,16 +930,34 @@ def verify_live_id(video_id, source_kind):
     if time.time() < YTDLP_PROBE_COOLDOWN_UNTIL:
         return None
 
+    # Try both validation clients without breaking prematurely if the first client sets cooldown
     for client in VALIDATION_CLIENTS[:2]:
-        candidate = validate_candidate(video_id, client)
+        candidate = validate_candidate(video_id, client, force_cookie=False)
         if candidate:
             elapsed = time.monotonic() - started
             PROBE_STATS["live_hits"] += 1
             write_summary(probe_stats=PROBE_STATS)
             log(f"detect_live | source={source_kind} | live id={candidate['id']} | client={client_label(candidate['client'])} | match={candidate['match_reason']} | validation={elapsed:.1f}s")
             return {"id": candidate["id"], "url": candidate["url"], "source": source_kind, "client": candidate["client"]}
-        if video_id in NON_LIVE_VOD_CACHE or time.time() < YTDLP_PROBE_COOLDOWN_UNTIL:
-            break
+        if video_id in NON_LIVE_VOD_CACHE:
+            return None
+
+    # Last-resort: If HTML was BLOCKED and cookie-free validation failed, verify with fallback cookies on mweb!
+    if state == "BLOCKED" and not USE_COOKIES and has_fallback_cookies():
+        candidate = validate_candidate(video_id, "mweb", force_cookie=True)
+        if candidate:
+            elapsed = time.monotonic() - started
+            PROBE_STATS["live_hits"] += 1
+            write_summary(probe_stats=PROBE_STATS)
+            log(f"detect_live | source={source_kind} | live id={candidate['id']} | client=mweb_cookie_fallback | match={candidate['match_reason']} | validation={elapsed:.1f}s")
+            return {
+                "id": candidate["id"],
+                "url": candidate["url"],
+                "source": source_kind,
+                "client": "mweb",
+                "cookie_rescue_locked": True,
+            }
+
     return None
 
 
@@ -991,14 +1036,25 @@ def probe_fast():
     if now >= YTDLP_PROBE_COOLDOWN_UNTIL:
         YTDLP_PROBE_COOLDOWN_UNTIL = now + 180
         info = run_ytdlp_json(LIVE_URL, "android_vr")
+        used_cookie_ep = False
+        if not info and "BLOCKED" in (live_state, home_state, streams_state) and not USE_COOKIES and has_fallback_cookies():
+            info = run_ytdlp_json(LIVE_URL, "mweb", force_cookie=True)
+            used_cookie_ep = bool(info)
         if info and is_live_candidate(info):
             matched, reason = target_match(info)
             if matched:
                 video_id = info["id"]
                 PROBE_STATS["live_hits"] += 1
                 write_summary(probe_stats=PROBE_STATS)
-                log(f"detect_live | source=live_endpoint_fallback | live id={video_id} | client=android_vr | match={reason}")
-                return {"id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}", "source": "live_endpoint", "client": "android_vr"}
+                ep_client = "mweb" if used_cookie_ep else "android_vr"
+                log(f"detect_live | source=live_endpoint_fallback | live id={video_id} | client={ep_client} | cookie={used_cookie_ep} | match={reason}")
+                return {
+                    "id": video_id,
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                    "source": "live_endpoint",
+                    "client": ep_client,
+                    "cookie_rescue_locked": used_cookie_ep,
+                }
 
     return None
 
@@ -1362,8 +1418,10 @@ def new_session(live):
     active = {
         "live_id": live_id,
         "live_url": f"https://www.youtube.com/watch?v={live_id}",
-        "preferred_client": None,
-        "client_locked": False,
+        "preferred_client": live.get("client") if live.get("cookie_rescue_locked") else None,
+        "client_locked": bool(live.get("cookie_rescue_locked")),
+        "cookie_rescue_locked": bool(live.get("cookie_rescue_locked")),
+        "force_cookie_locked": bool(live.get("cookie_rescue_locked")),
         "short_exit_streak": 0,
         "short_exit_seq": 0,
         "session_index": session_index,
@@ -1517,9 +1575,7 @@ def classify_output(output_state):
     return "normal_end" if output_state.get("normal_exit") else "no_file"
 
 
-def make_download_cmd(active, chunk_path, client, skip_webpage=True, use_proxy=False):
-    # Note: --downloader-args ffmpeg_i:... was removed in v8.8; it is ignored by the native
-    # HLS downloader (-downloader m3u8:native) which does its own fragment retries.
+def make_download_cmd(active, chunk_path, client, skip_webpage=True, use_proxy=False, force_cookie=False):
     command = [
         sys.executable, "-m", "yt_dlp", "--no-config", "--newline", "--no-warnings",
         "--restrict-filenames", "--no-part", "--no-playlist", "--no-live-from-start", "--match-filters", "is_live",
@@ -1541,8 +1597,11 @@ def make_download_cmd(active, chunk_path, client, skip_webpage=True, use_proxy=F
                 ffmpeg_in_args = f"-http_proxy {proxy} " + ffmpeg_in_args
     command += ["--downloader-args", f"ffmpeg_i:{ffmpeg_in_args}"]
     command += build_extractor_args(client, skip_webpage=skip_webpage)
-    if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE) and client not in COOKIE_INCOMPATIBLE_CLIENTS:
-        command += ["--cookies", COOKIE_FILE]
+    if client not in COOKIE_INCOMPATIBLE_CLIENTS:
+        if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE):
+            command += ["--cookies", COOKIE_FILE]
+        elif force_cookie and has_fallback_cookies():
+            command += ["--cookies", FALLBACK_COOKIE_FILE]
     command.append(active["live_url"])
     return command
 
@@ -1692,7 +1751,7 @@ def drain_latest_candidate(live_queue):
     return latest
 
 
-def run_download_attempt(active, session_end, client, live_queue, skip_webpage=True, use_proxy=False):
+def run_download_attempt(active, session_end, client, live_queue, skip_webpage=True, use_proxy=False, force_cookie=False):
     global CURRENT_PROC, STOP_REQUESTED, DISK_LIMIT_REACHED
     if shutil.disk_usage(OUT_DIR).free < MIN_FREE_DISK_BYTES:
         DISK_LIMIT_REACHED = True
@@ -1705,10 +1764,11 @@ def run_download_attempt(active, session_end, client, live_queue, skip_webpage=T
     active["recording_path"] = chunk_path
     save_active_state(active)
 
-    command = make_download_cmd(active, chunk_path, client, skip_webpage=skip_webpage, use_proxy=use_proxy)
+    command = make_download_cmd(active, chunk_path, client, skip_webpage=skip_webpage, use_proxy=use_proxy, force_cookie=force_cookie)
     left = max(0, session_end - time.time())
     route = "warp_proxy" if (use_proxy and warp_proxy_url()) else "direct"
-    log(f"[{hms(left)} left] download_started | chunk={index:04d} | client={client_label(client)} | route={route} | skip_webpage={skip_webpage}")
+    c_mode = "cookie_fallback" if force_cookie else ("cookies" if USE_COOKIES else "cookie_free")
+    log(f"[{hms(left)} left] download_started | chunk={index:04d} | client={client_label(client)} | route={route} | mode={c_mode} | skip_webpage={skip_webpage}")
 
     proc_env = os.environ.copy()
     if use_proxy:
@@ -1874,7 +1934,7 @@ def can_continue(session_end):
     return (not STOP_REQUESTED) and time.time() < session_end
 
 
-def attempt_with_fallbacks(active, session_end, client, live_queue):
+def attempt_with_fallbacks(active, session_end, client, live_queue, force_cookie=False):
     """
     One logical download attempt for `client`, walking route_order():
       route -> skip_webpage=True -> (if no_formats on an app client) skip_webpage=False on SAME route
@@ -1884,9 +1944,10 @@ def attempt_with_fallbacks(active, session_end, client, live_queue):
     routes = route_order()
     ok, reason, replacement_live = False, "download_failed", None
     for idx, use_proxy in enumerate(routes):
-        ok, reason, replacement_live = run_download_attempt(active, session_end, client, live_queue, skip_webpage=True, use_proxy=use_proxy)
+        extra = {"force_cookie": True} if force_cookie else {}
+        ok, reason, replacement_live = run_download_attempt(active, session_end, client, live_queue, skip_webpage=True, use_proxy=use_proxy, **extra)
         if not ok and reason == "no_formats" and client in SKIP_WEBPAGE_CLIENTS and can_continue(session_end):
-            ok, reason, replacement_live = run_download_attempt(active, session_end, client, live_queue, skip_webpage=False, use_proxy=use_proxy)
+            ok, reason, replacement_live = run_download_attempt(active, session_end, client, live_queue, skip_webpage=False, use_proxy=use_proxy, **extra)
         if ok or replacement_live or not can_continue(session_end):
             break
         if reason not in IP_BLOCK_REASONS:
@@ -1898,6 +1959,9 @@ def attempt_with_fallbacks(active, session_end, client, live_queue):
     return ok, reason, replacement_live
 
 
+COOKIE_RESCUE_CLIENTS = ["mweb", "web_safari", "tv", None]
+
+
 def record_until_stop(active, session_end, live_queue):
     if active.get("client_locked") and active.get("preferred_client") in DOWNLOAD_CLIENTS:
         preferred = active["preferred_client"]
@@ -1907,47 +1971,73 @@ def record_until_stop(active, session_end, live_queue):
 
     last_reason = "download_failed"
     transient_clients = set()
-    for client in clients:
-        short_attempts = 0
-        while can_continue(session_end):
-            ok, reason, replacement_live = attempt_with_fallbacks(active, session_end, client, live_queue)
-            if replacement_live:
-                return False, "new_live_id", replacement_live
-            if STOP_REQUESTED:
-                return False, "termination", None
-            if time.time() >= session_end:
-                return False, "session_end", None
-            if reason in {"not_live", "normal_end"}:
-                return False, reason, None
-            last_reason = reason
 
-            if reason == "transient":
-                transient_clients.add(client_label(client))
-                if len(transient_clients) >= 2:
-                    mark_ip_blocked("transient_on_multiple_clients")
+    def _walk_clients(client_list, force_cookie=False):
+        nonlocal last_reason
+        for idx, client in enumerate(client_list):
+            short_attempts = 0
+            while can_continue(session_end):
+                extra = {"force_cookie": True} if force_cookie else {}
+                ok, reason, replacement_live = attempt_with_fallbacks(active, session_end, client, live_queue, **extra)
+                if ok and force_cookie:
+                    active["cookie_rescue_locked"] = True
+                    active["force_cookie_locked"] = True
+                    active["preferred_client"] = client
+                    active["client_locked"] = True
+                    save_active_state(active)
+                if replacement_live:
+                    return True, (False, "new_live_id", replacement_live)
+                if STOP_REQUESTED:
+                    return True, (False, "termination", None)
+                if time.time() >= session_end:
+                    return True, (False, "session_end", None)
+                if reason in {"not_live", "normal_end"}:
+                    return True, (False, reason, None)
+                last_reason = reason
 
-            if reason in CLIENT_SWITCH_REASONS:
-                log(f"client_blocked | client={client_label(client)} | reason={reason} | switching to next client")
-                break
+                if reason == "transient":
+                    transient_clients.add(client_label(client))
+                    if len(transient_clients) >= 2:
+                        mark_ip_blocked("transient_on_multiple_clients")
 
-            if reason == "short_exit":
-                short_attempts += 1
-                if short_attempts <= SHORT_EXIT_RETRIES:
-                    log(f"short_exit_retry | client={client_label(client)} | retry={short_attempts}/{SHORT_EXIT_RETRIES} | waiting={SHORT_EXIT_BACKOFF_SECONDS}s")
-                    time.sleep(SHORT_EXIT_BACKOFF_SECONDS)
+                if reason in CLIENT_SWITCH_REASONS:
+                    log(f"client_blocked | client={client_label(client)} | cookie={force_cookie or USE_COOKIES} | reason={reason} | switching to next client")
+                    break
+
+                if reason == "short_exit":
+                    short_attempts += 1
+                    if short_attempts <= SHORT_EXIT_RETRIES:
+                        log(f"short_exit_retry | client={client_label(client)} | retry={short_attempts}/{SHORT_EXIT_RETRIES} | waiting={SHORT_EXIT_BACKOFF_SECONDS}s")
+                        time.sleep(SHORT_EXIT_BACKOFF_SECONDS)
+                        continue
+                    log(f"short_exit_limit_reached | client={client_label(client)} | moving to next client")
+                    break
+
+                if ok and reason in {"stalled", "downloader_exit", "short_chunk_preserved"}:
+                    short_attempts = 0
+                    time.sleep(STALL_RETRY_BACKOFF_SECONDS)
                     continue
-                log(f"short_exit_limit_reached | client={client_label(client)} | moving to next client")
                 break
 
-            if ok and reason in {"stalled", "downloader_exit", "short_chunk_preserved"}:
-                short_attempts = 0
-                time.sleep(STALL_RETRY_BACKOFF_SECONDS)
-                continue
-            break
+            if idx < len(client_list) - 1 and last_reason not in {"not_live", "normal_end"}:
+                log(f"client_fallback_wait | {CLIENT_SWITCH_DELAY_SECONDS}s before fallback")
+                time.sleep(CLIENT_SWITCH_DELAY_SECONDS)
+        return False, None
 
-        if client != clients[-1] and last_reason not in {"not_live", "normal_end"}:
-            log(f"client_fallback_wait | {CLIENT_SWITCH_DELAY_SECONDS}s before fallback")
-            time.sleep(CLIENT_SWITCH_DELAY_SECONDS)
+    if not (not USE_COOKIES and (active.get("cookie_rescue_locked") or active.get("force_cookie_locked")) and has_fallback_cookies()):
+        done, result = _walk_clients(clients, force_cookie=False)
+        if done:
+            return result
+
+    if not USE_COOKIES and has_fallback_cookies() and can_continue(session_end):
+        rescue_clients = list(COOKIE_RESCUE_CLIENTS)
+        if active.get("client_locked") and active.get("preferred_client") in rescue_clients:
+            pref = active["preferred_client"]
+            rescue_clients = [pref] + [c for c in rescue_clients if c != pref]
+        log(f"cookie_fallback_triggered | cookie_rescue_locked={bool(active.get('cookie_rescue_locked'))} | last_reason={last_reason}; running rescue pass with YT_COOKIES")
+        done, result = _walk_clients(rescue_clients, force_cookie=True)
+        if done:
+            return result
 
     active["last_failure_reason"] = last_reason
     active["recovery_needed"] = True
