@@ -176,8 +176,12 @@ jobs:
           # and disables android_vr/ios clients in yt-dlp!
           export USE_COOKIES="false"
           export COOKIE_FILE=""
+          if [ -n "$YT_COOKIES" ]; then
+            printf "%s\n" "$YT_COOKIES" > /tmp/fallback_cookies.txt
+            export FALLBACK_COOKIE_FILE="/tmp/fallback_cookies.txt"
+          fi
           if [ "${INPUT_USE_COOKIES}" == "true" ] && [ -n "$YT_COOKIES" ]; then
-            echo "$YT_COOKIES" > cookies.txt
+            printf "%s\n" "$YT_COOKIES" > cookies.txt
             export USE_COOKIES="true"
             export FORCE_COOKIES="true"
             export COOKIE_FILE="cookies.txt"
