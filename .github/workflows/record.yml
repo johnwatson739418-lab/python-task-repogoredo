@@ -11,7 +11,7 @@ name: Stream Recorder
       shifts_left:
         description: "Continuation shifts after this one (default 1 = up to 2 shifts / ~8h total; auto-disabled if hours < 1.0)"
         required: false
-        default: "1"
+        default: "2"
         type: string
       always_continue:
         description: "true = start the next shift even if the streamer is offline at shift end. false = chain only if live."
@@ -19,9 +19,9 @@ name: Stream Recorder
         default: "true"
         type: string
       use_cookies:
-        description: "Set to true to use YT_COOKIES secret if available (default false)"
+        description: "Set to true to use YT_COOKIES secret if available (default true)"
         required: false
-        default: "false"
+        default: "true"
         type: string
       custom_target:
         description: "Optional single channel override (e.g. @DWNews| or @prankurv123|UCYe2VVWgjUoEEn9LaLSCk9w). Leave empty for full matrix."
@@ -65,6 +65,7 @@ jobs:
               "gauravdev833844-gif/py-task-runner": "@BagadBillagang-p6s|UC6_0vYIN2dy3MvBuUSvtZJg",
               "gauravdev833844-gif/py-task-reposit": "@baskarfiroz15|UCSuA9LrSsE4-GSaSYDUZhNw",
               "h29257583-svg/py-task-floxrepo": "@floxiclip|UCNty54b8Vzmk-9BRYfF0EVQ",
+              "gauravdev833844-gif/py-task-jassi": "@thejassilive|UC5TqzXAyi39csmR72vynW2w",
           }
           custom = os.environ.get("CUSTOM_TARGET", "").strip()
           repo = os.environ.get("CURRENT_REPO", "").strip()
@@ -163,9 +164,9 @@ jobs:
         env:
           TARGET_DATA: ${{ matrix.target }}
           INPUT_HOURS: ${{ github.event.inputs.hours || '4.5' }}
-          INPUT_SHIFTS_LEFT: ${{ github.event.inputs.shifts_left || '1' }}
+          INPUT_SHIFTS_LEFT: ${{ github.event.inputs.shifts_left || '2' }}
           INPUT_ALWAYS_CONTINUE: ${{ github.event.inputs.always_continue || 'true' }}
-          INPUT_USE_COOKIES: ${{ github.event.inputs.use_cookies || 'false' }}
+          INPUT_USE_COOKIES: ${{ github.event.inputs.use_cookies || 'true' }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           GH_FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}

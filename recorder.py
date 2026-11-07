@@ -98,7 +98,7 @@ POLL_INTERVAL_SECONDS = 2
 STALL_SECONDS = 240
 OFFLINE_GRACE_SECONDS = 180
 FAILURE_COOLDOWN_SECONDS = 8
-PREWARM_LEAD_SECONDS = 180
+PREWARM_LEAD_SECONDS = 1800  # 30m early pre-warm overlap
 PREWARM_MAX_ATTEMPTS = 2
 PREWARM_BACKOFF_SECONDS = 60
 PREWARM_ACTIVE_GROWTH_SEC = 15
@@ -509,8 +509,16 @@ def _run_curl_fetch(curl_bin, url, use_proxy=False):
         curl_bin, "-s", "-L", "--compressed", "--max-time", str(HTML_TIMEOUT_SECONDS),
         "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "-H", "Accept-Language: en-US,en;q=0.9",
-        "-H", "Cookie: CONSENT=YES+cb.20210328-17-p0.en+FX+999; SOCS=CAISHAgBEhJnd3NfMjAyMzA4MTVfMF9SQzIaAmVuIAEaBgiAo_CmBg",
     ]
+    cookie_to_use = None
+    if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE):
+        cookie_to_use = COOKIE_FILE
+    elif has_fallback_cookies():
+        cookie_to_use = FALLBACK_COOKIE_FILE
+    if cookie_to_use:
+        cmd += ["--cookie", cookie_to_use]
+    else:
+        cmd += ["-H", "Cookie: CONSENT=YES+cb.20210328-17-p0.en+FX+999; SOCS=CAISHAgBEhJnd3NfMjAyMzA4MTVfMF9SQzIaAmVuIAEaBgiAo_CmBg"]
     if use_proxy and warp_proxy_url():
         cmd += ["--socks5-hostname", "127.0.0.1:40000"]
     cmd.append(url)
@@ -1190,8 +1198,8 @@ def maybe_prewarm_continuation_shift():
     ]
     if os.getenv("ALWAYS_CONTINUE") is not None:
         cmd += ["-f", f"always_continue={'true' if ALWAYS_CONTINUE else 'false'}"]
-    if os.getenv("INPUT_USE_COOKIES"):
-        cmd += ["-f", f"use_cookies={os.getenv('INPUT_USE_COOKIES').strip().lower()}"]
+    use_cookies_val = 'true' if (USE_COOKIES or os.getenv('INPUT_USE_COOKIES') == 'true') else 'false'
+    cmd += ['-f', f'use_cookies={use_cookies_val}']
 
     last_error = ""
     for position, token in enumerate(tokens, start=1):
