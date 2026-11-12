@@ -19,9 +19,9 @@ name: Stream Recorder
         default: "true"
         type: string
       use_cookies:
-        description: "Set to true to use YT_COOKIES secret if available (default true)"
+        description: "Set to true to force YT_COOKIES on primary pass (default false = cookie-free primary + auto cookie rescue fallback)"
         required: false
-        default: "true"
+        default: "false"
         type: string
       custom_target:
         description: "Optional single channel override (e.g. @DWNews| or @prankurv123|UCYe2VVWgjUoEEn9LaLSCk9w). Leave empty for full matrix."
@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       targets: ${{ steps.resolve.outputs.targets }}
@@ -82,8 +82,8 @@ jobs:
 
   record:
     needs: plan
-    runs-on: ubuntu-latest
-    timeout-minutes: 350
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
     strategy:
       fail-fast: false
       matrix:
@@ -103,21 +103,75 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Start Cloudflare WARP Proxy (Port 40000), Privoxy HTTP Bridge (Port 8118) & bgutil PO-Token Server (Port 4416)
+      - name: Install System Dependencies (FFmpeg, rclone, WARP, Privoxy) & Start bgutil PO-Token Server
         run: |
-          # 1. Start local Cloudflare WARP SOCKS5 proxy on 127.0.0.1:40000 to bypass Azure subnet rate-limits
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null || true
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null 2>&1 || true
-          sudo apt-get update -qq 2>/dev/null || true
-          sudo apt-get install -y -qq cloudflare-warp privoxy 2>/dev/null || true
+          # 0. Force IPv4 & tight HTTP timeouts on apt so Azure Ubuntu mirror hiccups never hang 50-90 mins
+          printf 'Acquire::ForceIPv4 "true";\nAcquire::http::Timeout "10";\nAcquire::https::Timeout "10";\nAcquire::Retries "2";\n' | sudo tee /etc/apt/apt.conf.d/99force-ipv4 > /dev/null
+          CODENAME=$(lsb_release -cs 2>/dev/null || echo "noble")
+          MIRRORS=(
+            "https://mirrors.edge.kernel.org/ubuntu/"
+            "http://us.archive.ubuntu.com/ubuntu/"
+            "http://archive.ubuntu.com/ubuntu/"
+          )
+          WORKING_MIRROR=""
+          for m in "${MIRRORS[@]}"; do
+            if curl -sfI --max-time 4 "${m}dists/${CODENAME}/Release" >/dev/null 2>&1; then
+              WORKING_MIRROR="$m"
+              break
+            fi
+          done
+          if [ -n "$WORKING_MIRROR" ]; then
+            echo "Switching Ubuntu mirror to verified host: $WORKING_MIRROR"
+            sudo sed -i "s|http://azure.archive.ubuntu.com/ubuntu/|$WORKING_MIRROR|g; s|http://azure.archive.ubuntu.com/ubuntu|$WORKING_MIRROR|g" /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/apt-mirrors.txt 2>/dev/null || true
+          else
+            echo "Mirror probe failed; adding public DNS resolvers..."
+            printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" | sudo tee /etc/resolv.conf > /dev/null || true
+          fi
+
+          # 1. Add Cloudflare WARP apt repo (best-effort)
+          WARP_REPO_OK="false"
+          if curl -fsSL --max-time 15 https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null; then
+            echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${CODENAME} main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+            WARP_REPO_OK="true"
+          fi
+
+          # 2. Install all required OS packages in one bounded pass
+          MISSING_PKGS=""
+          command -v ffmpeg >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS ffmpeg"
+          command -v jq >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS jq"
+          command -v curl >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS curl"
+          command -v privoxy >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS privoxy"
+          command -v rclone >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS rclone"
+          if [ "$WARP_REPO_OK" = "true" ] && ! command -v warp-cli >/dev/null 2>&1; then
+            MISSING_PKGS="$MISSING_PKGS cloudflare-warp"
+          fi
+          echo "Missing packages: ${MISSING_PKGS:-none}"
+
+          if [ -n "$MISSING_PKGS" ]; then
+            if ! sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+              echo "apt-get update failed with Cloudflare repo; retrying Ubuntu mirrors only..."
+              sudo rm -f /etc/apt/sources.list.d/cloudflare-client.list
+              sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+              MISSING_PKGS="${MISSING_PKGS/ cloudflare-warp/}"
+            fi
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $MISSING_PKGS || true
+          fi
+
+          if ! command -v rclone >/dev/null 2>&1; then
+            echo "Installing rclone via official installer fallback..."
+            curl -fsSL --max-time 25 https://rclone.org/install.sh | sudo bash || true
+          fi
+          echo "Binary check -> ffmpeg: $(command -v ffmpeg || echo MISSING), rclone: $(command -v rclone || echo MISSING), warp-cli: $(command -v warp-cli || echo MISSING), privoxy: $(command -v privoxy || echo MISSING)"
+
+          # 3. Start local Cloudflare WARP SOCKS5 proxy on 127.0.0.1:40000
           if command -v warp-cli >/dev/null 2>&1; then
-            sudo systemctl start warp-svc 2>/dev/null || sudo warp-svc &
+            sudo systemctl start warp-svc 2>/dev/null || sudo warp-svc >/tmp/warp-svc.log 2>&1 &
             sleep 2
             warp-cli --accept-tos registration new 2>/dev/null || warp-cli --accept-tos register 2>/dev/null || warp-cli register 2>/dev/null || true
             warp-cli --accept-tos mode proxy 2>/dev/null || warp-cli --accept-tos set-mode proxy 2>/dev/null || warp-cli set-mode proxy 2>/dev/null || true
             warp-cli --accept-tos proxy port 40000 2>/dev/null || warp-cli --accept-tos set-proxy-port 40000 2>/dev/null || warp-cli set-proxy-port 40000 2>/dev/null || true
             warp-cli --accept-tos connect 2>/dev/null || warp-cli connect 2>/dev/null || true
-            for _ in 1 2 3 4 5; do
+            for _ in 1 2 3 4 5 6; do
               if curl -s --socks5-hostname 127.0.0.1:40000 --max-time 4 https://www.cloudflare.com/cdn-cgi/trace | grep -qE "warp=(on|plus)"; then
                 echo "Cloudflare WARP proxy verified ACTIVE on 127.0.0.1:40000"
                 echo "WARP_PROXY=socks5://127.0.0.1:40000" >> "$GITHUB_ENV"
@@ -127,9 +181,9 @@ jobs:
             done
           fi
 
-          # 2. Start Privoxy HTTP bridge on 127.0.0.1:8118 -> forward to WARP SOCKS5 (Allows FFmpeg to route through WARP without 403)
+          # 4. Start Privoxy HTTP bridge on 127.0.0.1:8118 -> forward to WARP SOCKS5
           if [ -f "/etc/privoxy/config" ]; then
-            echo "forward-socks5t / 127.0.0.1:40000 ." | sudo tee -a /etc/privoxy/config >/dev/null 2>&1 || true
+            grep -q "forward-socks5t / 127.0.0.1:40000 ." /etc/privoxy/config || echo "forward-socks5t / 127.0.0.1:40000 ." | sudo tee -a /etc/privoxy/config >/dev/null
             sudo systemctl restart privoxy 2>/dev/null || sudo privoxy /etc/privoxy/config &
             sleep 1
             for _ in 1 2 3 4; do
@@ -142,7 +196,7 @@ jobs:
             done
           fi
 
-          # 2. Start bgutil PO-Token HTTP server on 127.0.0.1:4416
+          # 5. Start bgutil PO-Token HTTP server on 127.0.0.1:4416
           git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /tmp/bgutil-ytdlp-pot-provider || true
           if [ -d "/tmp/bgutil-ytdlp-pot-provider/server" ]; then
             cd /tmp/bgutil-ytdlp-pot-provider/server
@@ -166,7 +220,7 @@ jobs:
           INPUT_HOURS: ${{ github.event.inputs.hours || '4.5' }}
           INPUT_SHIFTS_LEFT: ${{ github.event.inputs.shifts_left || '2' }}
           INPUT_ALWAYS_CONTINUE: ${{ github.event.inputs.always_continue || 'true' }}
-          INPUT_USE_COOKIES: ${{ github.event.inputs.use_cookies || 'true' }}
+          INPUT_USE_COOKIES: ${{ github.event.inputs.use_cookies || 'false' }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           GH_FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -330,8 +384,10 @@ jobs:
             CHANNEL_HANDLE="recorded_channel"
           fi
 
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq curl rclone
+          if ! command -v jq >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1 || ! command -v rclone >/dev/null 2>&1; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq jq curl rclone || true
+          fi
           mkdir -p ./streams
 
           mapfile -t FILES < <(find ./streams -type f \( -name "*.ts" -o -name "*.mp4" \) ! -name "*.part" ! -name "*_short_exit_*" -size +1M | sort)
