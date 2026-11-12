@@ -305,9 +305,9 @@ class TestRecorderV88Final(unittest.TestCase):
              patch.object(recorder, "run_download_attempt", side_effect=fake_attempt):
             recorder.record_until_stop(active, recorder.time.time() + 60, recorder.Queue())
 
-        self.assertEqual(calls[0], ("android_vr", True, False))
-        self.assertEqual(calls[1], ("android_vr", True, True))
-        self.assertEqual(calls[2], ("android_vr", False, True))
+        self.assertEqual(calls[0], ("android", True, False))
+        self.assertEqual(calls[1], ("android", True, True))
+        self.assertEqual(calls[2], ("android", False, True))
 
 
 if __name__ == "__main__":
