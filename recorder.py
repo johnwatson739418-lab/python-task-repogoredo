@@ -223,6 +223,13 @@ def normalize_message(value):
 
 
 BOTCHECK_MARKERS = ["sign in to confirm you're not a bot", "confirm you're not a bot"]
+AUTH_REQUIRED_MARKERS = [
+    "members-only",
+    "members on level",
+    "available to this channel's members",
+    "join this channel",
+    "private video",
+]
 NO_FORMAT_MARKERS = ["no video formats found", "requested format is not available"]
 RATE_LIMIT_MARKERS = [
     "rate-limited by youtube",
@@ -250,7 +257,7 @@ NOT_LIVE_MARKERS = [
 NORMAL_END_MARKERS = ["finished downloading", "download complete", "has already been downloaded"]
 
 IP_BLOCK_REASONS = {"botcheck", "rate_limited", "access_restricted"}
-CLIENT_SWITCH_REASONS = IP_BLOCK_REASONS | {"no_formats", "transient"}
+CLIENT_SWITCH_REASONS = IP_BLOCK_REASONS | {"auth_required", "no_formats", "transient"}
 
 
 SUMMARY = {
@@ -468,9 +475,10 @@ def install_dependencies():
     if required:
         log(f"installing_os_packages | {','.join(required)}")
         sudo_prefix = ["sudo"] if command_exists("sudo") else []
+        apt_opts = ["-o", "Acquire::ForceIPv4=true", "-o", "Acquire::http::Timeout=10", "-o", "Acquire::Retries=2"]
         try:
-            subprocess.run(sudo_prefix + ["apt-get", "update", "-qq"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(sudo_prefix + ["apt-get", "install", "-y", "-qq"] + required, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(sudo_prefix + ["apt-get"] + apt_opts + ["update", "-qq"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
+            subprocess.run(sudo_prefix + ["apt-get"] + apt_opts + ["install", "-y", "-qq"] + required, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
         except Exception as exc:
             log_raw("os_dependency_error", exc)
 
@@ -504,16 +512,20 @@ JS_ARGS = []
 # HTML fetching / classification
 # --------------------------------------------------------------------------------------
 
+_FETCH_TLS = threading.local()
+
+
 def _run_curl_fetch(curl_bin, url, use_proxy=False):
     cmd = [
         curl_bin, "-s", "-L", "--compressed", "--max-time", str(HTML_TIMEOUT_SECONDS),
         "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "-H", "Accept-Language: en-US,en;q=0.9",
     ]
+    allow_fallback_cookie = bool(getattr(_FETCH_TLS, "allow_fallback_cookie", False))
     cookie_to_use = None
     if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE):
         cookie_to_use = COOKIE_FILE
-    elif has_fallback_cookies():
+    elif allow_fallback_cookie and has_fallback_cookies():
         cookie_to_use = FALLBACK_COOKIE_FILE
     if cookie_to_use:
         cmd += ["--cookie", cookie_to_use]
@@ -532,19 +544,26 @@ def _run_curl_fetch(curl_bin, url, use_proxy=False):
 
 
 def fetch_text(url):
-    """Fetch a page, trying routes in route_order(); return the first clean page, else the best effort."""
+    """Fetch a page across routes (anonymous first when USE_COOKIES=False to protect shared YT_COOKIES, then fallback cookies only if blocked)."""
     curl_bin = shutil.which("curl")
     if not curl_bin:
         return ""
     best = ""
-    for use_proxy in route_order():
-        html = _run_curl_fetch(curl_bin, url, use_proxy=use_proxy)
-        if not html:
-            continue
-        state, _ = inspect_youtube_html(html)
-        if state in ("LIVE", "UPCOMING", "NOT_LIVE"):
-            return html
-        best = best or html
+    cookie_passes = [False] if USE_COOKIES or not has_fallback_cookies() else [False, True]
+    prev_flag = getattr(_FETCH_TLS, "allow_fallback_cookie", False)
+    try:
+        for allow_fb in cookie_passes:
+            _FETCH_TLS.allow_fallback_cookie = allow_fb
+            for use_proxy in route_order():
+                html = _run_curl_fetch(curl_bin, url, use_proxy=use_proxy)
+                if not html:
+                    continue
+                state, _ = inspect_youtube_html(html)
+                if state in ("LIVE", "UPCOMING", "NOT_LIVE"):
+                    return html
+                best = best or html
+    finally:
+        _FETCH_TLS.allow_fallback_cookie = prev_flag
     return best
 
 
@@ -1568,6 +1587,7 @@ def output_reader(stream, output_state):
         if "chosen=" in raw_line or "error:" in lowered or "warning:" in lowered:
             log_raw("yt_dlp", raw_line)
         output_state["botcheck"] |= any(marker in lowered for marker in BOTCHECK_MARKERS)
+        output_state["auth_required"] |= any(marker in lowered for marker in AUTH_REQUIRED_MARKERS)
         output_state["no_formats"] |= any(marker in lowered for marker in NO_FORMAT_MARKERS)
         output_state["rate_limited"] |= any(marker in lowered for marker in RATE_LIMIT_MARKERS)
         output_state["transient"] |= any(marker in lowered for marker in TRANSIENT_MARKERS)
@@ -1577,7 +1597,7 @@ def output_reader(stream, output_state):
 
 
 def classify_output(output_state):
-    for key in ("botcheck", "rate_limited", "access_restricted", "transient", "no_formats", "not_live"):
+    for key in ("botcheck", "auth_required", "rate_limited", "access_restricted", "transient", "no_formats", "not_live"):
         if output_state.get(key):
             return key
     return "normal_end" if output_state.get("normal_exit") else "no_file"
@@ -1802,7 +1822,7 @@ def run_download_attempt(active, session_end, client, live_queue, skip_webpage=T
     DOWNLOAD_ACTIVE.set()
 
     output_state = {
-        "botcheck": False, "no_formats": False, "rate_limited": False, "transient": False,
+        "botcheck": False, "auth_required": False, "no_formats": False, "rate_limited": False, "transient": False,
         "access_restricted": False, "not_live": False, "normal_exit": False, "chosen_seen": False,
     }
     reader = threading.Thread(target=output_reader, args=(process.stdout, output_state), daemon=True)
@@ -1870,7 +1890,7 @@ def run_download_attempt(active, session_end, client, live_queue, skip_webpage=T
         output_state["not_live"] = True
     explicit_end = output_state["not_live"] or output_state["normal_exit"]
     explicit_error = (
-        output_state["botcheck"] or output_state["no_formats"] or output_state["rate_limited"]
+        output_state["botcheck"] or output_state["auth_required"] or output_state["no_formats"] or output_state["rate_limited"]
         or output_state["transient"] or output_state["access_restricted"]
     )
 
@@ -2010,6 +2030,8 @@ def record_until_stop(active, session_end, live_queue):
 
                 if reason in CLIENT_SWITCH_REASONS:
                     log(f"client_blocked | client={client_label(client)} | cookie={force_cookie or USE_COOKIES} | reason={reason} | switching to next client")
+                    if not force_cookie and not USE_COOKIES and reason == "auth_required" and has_fallback_cookies():
+                        return False, None
                     break
 
                 if reason == "short_exit":
@@ -2114,7 +2136,7 @@ def wait_for_start_time():
 
 FAILURE_REASONS = {
     "not_live", "normal_end", "download_failed", "launch_error",
-    "botcheck", "rate_limited", "access_restricted", "transient", "no_formats", "no_file", "short_exit",
+    "botcheck", "auth_required", "rate_limited", "access_restricted", "transient", "no_formats", "no_file", "short_exit",
 }
 
 
