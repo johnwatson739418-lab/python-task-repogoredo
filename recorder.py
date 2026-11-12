@@ -114,7 +114,7 @@ STALL_RETRY_BACKOFF_SECONDS = 2
 CLIENT_SWITCH_DELAY_SECONDS = 4
 
 DOWNLOAD_CLIENTS = ["android_vr", "android", "ios", "mweb", "web_safari", "tv", None]
-VALIDATION_CLIENTS = ["android_vr", "mweb", "web_safari"]
+VALIDATION_CLIENTS = ["android", "android_vr", "mweb", "web_safari"]
 SKIP_WEBPAGE_CLIENTS = {"android_vr", "android", "ios"}
 COOKIE_INCOMPATIBLE_CLIENTS = {"android_vr", "android", "ios"}
 IMPERSONATE_CLIENTS = {"mweb", "web_safari", "tv", None}
@@ -129,6 +129,7 @@ POT_SERVER_ACTIVE = False
 IMPERSONATE_OK = False
 NON_LIVE_VOD_CACHE = set()
 YTDLP_PROBE_COOLDOWN_UNTIL = 0.0
+YTDLP_CANDIDATE_COOLDOWN_UNTIL = 0.0
 WARP_PREFERRED_UNTIL = 0.0
 LAST_BLOCKED_LOG_AT = 0.0
 LAST_HEARTBEAT_LOG_AT = 0.0
@@ -920,6 +921,7 @@ def validate_candidate(video_id, client, force_cookie=False):
 
 
 def verify_live_id(video_id, source_kind):
+    global YTDLP_CANDIDATE_COOLDOWN_UNTIL
     video_id = str(video_id or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id) or video_id in NON_LIVE_VOD_CACHE:
         return None
@@ -954,11 +956,12 @@ def verify_live_id(video_id, source_kind):
         PROBE_STATS["error"] += 1
         write_summary(probe_stats=PROBE_STATS)
 
-    if time.time() < YTDLP_PROBE_COOLDOWN_UNTIL:
+    # Candidate validation uses its own short cooldown so blind /live probes cannot starve RSS/badge detection.
+    if time.time() < YTDLP_CANDIDATE_COOLDOWN_UNTIL:
         return None
 
-    # Try both validation clients without breaking prematurely if the first client sets cooldown
-    for client in VALIDATION_CLIENTS[:2]:
+    # Walk unblocked clients (android first) even if HTML/android_vr is botchecked.
+    for client in VALIDATION_CLIENTS[:3]:
         candidate = validate_candidate(video_id, client, force_cookie=False)
         if candidate:
             elapsed = time.monotonic() - started
@@ -985,6 +988,7 @@ def verify_live_id(video_id, source_kind):
                 "cookie_rescue_locked": True,
             }
 
+    YTDLP_CANDIDATE_COOLDOWN_UNTIL = time.time() + 60
     return None
 
 
@@ -1062,7 +1066,7 @@ def probe_fast():
 
     if now >= YTDLP_PROBE_COOLDOWN_UNTIL:
         YTDLP_PROBE_COOLDOWN_UNTIL = now + 180
-        info = run_ytdlp_json(LIVE_URL, "android_vr")
+        info = run_ytdlp_json(LIVE_URL, "android") or run_ytdlp_json(LIVE_URL, "android_vr")
         used_cookie_ep = False
         if not info and "BLOCKED" in (live_state, home_state, streams_state) and not USE_COOKIES and has_fallback_cookies():
             info = run_ytdlp_json(LIVE_URL, "mweb", force_cookie=True)
