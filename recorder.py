@@ -91,7 +91,7 @@ SECONDARY_WAITING_RECHECK_SECONDS = 90
 SECONDARY_ACTIVE_RECHECK_SECONDS = 120
 
 PROBE_TIMEOUT_SECONDS = 15
-HTML_TIMEOUT_SECONDS = 8
+HTML_TIMEOUT_SECONDS = 5
 
 HEARTBEAT_SECONDS = 15
 POLL_INTERVAL_SECONDS = 2
@@ -113,10 +113,11 @@ SHORT_EXIT_BACKOFF_SECONDS = 4
 STALL_RETRY_BACKOFF_SECONDS = 2
 CLIENT_SWITCH_DELAY_SECONDS = 4
 
-DOWNLOAD_CLIENTS = ["android_vr", "android", "ios", "mweb", "web_safari", "tv", None]
+DOWNLOAD_CLIENTS = ["android", "android_vr", "ios", "mweb", "web_safari", "tv", None]
 VALIDATION_CLIENTS = ["android", "android_vr", "mweb", "web_safari"]
 SKIP_WEBPAGE_CLIENTS = {"android_vr", "android", "ios"}
 COOKIE_INCOMPATIBLE_CLIENTS = {"android_vr", "android", "ios"}
+MOBILE_CLIENTS = {"android", "android_vr", "ios"}
 IMPERSONATE_CLIENTS = {"mweb", "web_safari", "tv", None}
 BOTCHECK_BASE_COOLDOWN_SECONDS = 45
 
@@ -444,11 +445,12 @@ def build_extractor_args(client, skip_webpage=False):
         yt_parts.append(f"player_client={client}")
         if skip_webpage and client in SKIP_WEBPAGE_CLIENTS:
             yt_parts.append("player_skip=webpage,configs")
-    if POT_SERVER_ACTIVE:
+    use_pot = POT_SERVER_ACTIVE and (client not in MOBILE_CLIENTS)
+    if use_pot:
         yt_parts.append("fetch_pot=always")
     if yt_parts:
         args += ["--extractor-args", "youtube:" + ";".join(yt_parts)]
-    if POT_SERVER_ACTIVE:
+    if use_pot:
         args += ["--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"]
     return args
 
@@ -544,13 +546,13 @@ def _run_curl_fetch(curl_bin, url, use_proxy=False):
     return ""
 
 
-def fetch_text(url):
-    """Fetch a page across routes (anonymous first when USE_COOKIES=False to protect shared YT_COOKIES, then fallback cookies only if blocked)."""
+def fetch_text(url, allow_cookie_rescue=False):
+    """Fetch a page across routes without stalling on excessive sequential curl passes."""
     curl_bin = shutil.which("curl")
     if not curl_bin:
         return ""
     best = ""
-    cookie_passes = [False] if USE_COOKIES or not has_fallback_cookies() else [False, True]
+    cookie_passes = [False, True] if (allow_cookie_rescue and not USE_COOKIES and has_fallback_cookies()) else [False]
     prev_flag = getattr(_FETCH_TLS, "allow_fallback_cookie", False)
     try:
         for allow_fb in cookie_passes:
@@ -809,7 +811,7 @@ def inspect_youtube_html(html):
 # --------------------------------------------------------------------------------------
 
 def _exec_ytdlp_json(url, client, use_proxy=False, force_cookie=False):
-    skip_wp = (client in SKIP_WEBPAGE_CLIENTS) and ("/watch?v=" in str(url))
+    skip_wp = (client in SKIP_WEBPAGE_CLIENTS) and ("/watch?v=" in str(url) or "/live" in str(url))
     command = [
         sys.executable, "-m", "yt_dlp", "--no-config", "-J",
         "--skip-download", "--no-warnings", "--ignore-no-formats-error",
@@ -938,7 +940,7 @@ def verify_live_id(video_id, source_kind):
             PROBE_STATS["live_hits"] += 1
             write_summary(probe_stats=PROBE_STATS)
             log(f"detect_live | source={source_kind} | live id={video_id} | client=html_strict | match=strict_videoDetails | validation={elapsed:.1f}s")
-            return {"id": video_id, "url": watch_url, "source": source_kind, "client": "android_vr"}
+            return {"id": video_id, "url": watch_url, "source": source_kind, "client": "android"}
         cache_non_live_vod(video_id)
         return None
 
@@ -988,7 +990,20 @@ def verify_live_id(video_id, source_kind):
                 "cookie_rescue_locked": True,
             }
 
-    YTDLP_CANDIDATE_COOLDOWN_UNTIL = time.time() + 60
+    return None
+
+
+def probe_rss_only():
+    """Fast XML-only fallback when HTML probes are blocked by YouTube captcha."""
+    channel_id = TARGET.get("channel_id")
+    if not channel_id:
+        return None
+    rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+    xml = fetch_text(rss_url)
+    for video_id in extract_rss_video_ids(xml):
+        result = verify_live_id(video_id, "rss_feed")
+        if result:
+            return result
     return None
 
 
@@ -1019,7 +1034,7 @@ def probe_fast():
     except Exception:
         pass
     finally:
-        executor.shutdown(wait=False)
+        executor.shutdown(wait=False, cancel_futures=True)
 
     live_state, live_details = inspect_youtube_html(pages["live"])
     home_state, _ = inspect_youtube_html(pages["home"])
@@ -1032,7 +1047,7 @@ def probe_fast():
             PROBE_STATS["live_hits"] += 1
             write_summary(probe_stats=PROBE_STATS)
             log(f"detect_live | source=direct_live_html | live id={vid} | client=html_strict | match=strict_videoDetails")
-            return {"id": vid, "url": f"https://www.youtube.com/watch?v={vid}", "source": "direct_live_html", "client": "android_vr"}
+            return {"id": vid, "url": f"https://www.youtube.com/watch?v={vid}", "source": "direct_live_html", "client": "android"}
 
     seen = set()
     for page_key in ("live", "home", "streams"):
@@ -1053,6 +1068,10 @@ def probe_fast():
         if now - LAST_BLOCKED_LOG_AT >= 120:
             LAST_BLOCKED_LOG_AT = now
             log(f"probe_blocked_warning | YouTube returned botcheck/captcha on HTML probe (blocked={PROBE_STATS['blocked']}, clean={PROBE_STATS['clean_offline']})")
+        # Immediately check RSS feed (XML is not blocked by HTML captcha!)
+        rss_hit = probe_rss_only()
+        if rss_hit:
+            return rss_hit
     elif live_state in clean and home_state in clean:
         PROBE_STATS["clean_offline"] += 1
         write_summary(probe_stats=PROBE_STATS)
@@ -1527,7 +1546,7 @@ def build_final_file(active):
                 fh.write(f"file '{escaped}'\n")
 
         result = subprocess.run(
-            [ffmpeg, "-hide_banner", "-loglevel", "error", "-fflags", "+genpts", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", "-y", final_path],
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-fflags", "+genpts+igndts", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", "-avoid_negative_ts", "make_zero", "-y", final_path],
             text=True, capture_output=True, timeout=1800,
         )
         if result.returncode == 0 and os.path.isfile(final_path) and os.path.getsize(final_path) >= MIN_SAVE_BYTES:
@@ -1581,23 +1600,31 @@ def close_session(active, reason):
 # --------------------------------------------------------------------------------------
 
 def output_reader(stream, output_state):
-    for raw_line in iter(stream.readline, ""):
-        if not raw_line:
-            break
-        print(raw_line, end="", flush=True)
-        lowered = normalize_message(raw_line)
-        if "chosen=" in raw_line:
-            output_state["chosen_seen"] = True
-        if "chosen=" in raw_line or "error:" in lowered or "warning:" in lowered:
-            log_raw("yt_dlp", raw_line)
-        output_state["botcheck"] |= any(marker in lowered for marker in BOTCHECK_MARKERS)
-        output_state["auth_required"] |= any(marker in lowered for marker in AUTH_REQUIRED_MARKERS)
-        output_state["no_formats"] |= any(marker in lowered for marker in NO_FORMAT_MARKERS)
-        output_state["rate_limited"] |= any(marker in lowered for marker in RATE_LIMIT_MARKERS)
-        output_state["transient"] |= any(marker in lowered for marker in TRANSIENT_MARKERS)
-        output_state["access_restricted"] |= any(marker in lowered for marker in ACCESS_RESTRICTED_MARKERS)
-        output_state["not_live"] |= any(marker in lowered for marker in NOT_LIVE_MARKERS)
-        output_state["normal_exit"] |= any(marker in lowered for marker in NORMAL_END_MARKERS)
+    try:
+        for raw_line in iter(stream.readline, ""):
+            if not raw_line:
+                break
+            lowered = normalize_message(raw_line)
+            # Suppress noisy FFmpeg HLS cuepoint/manifest lines from flooding GitHub Actions UI
+            if not (raw_line.startswith("[hls @") or raw_line.startswith("[https @") or raw_line.startswith("size=")):
+                print(raw_line, end="", flush=True)
+            if "chosen=" in raw_line:
+                output_state["chosen_seen"] = True
+            if "chosen=" in raw_line or "error:" in lowered or "warning:" in lowered:
+                log_raw("yt_dlp", raw_line)
+            output_state["botcheck"] |= any(marker in lowered for marker in BOTCHECK_MARKERS)
+            output_state["auth_required"] |= any(marker in lowered for marker in AUTH_REQUIRED_MARKERS)
+            output_state["no_formats"] |= any(marker in lowered for marker in NO_FORMAT_MARKERS)
+            output_state["rate_limited"] |= any(marker in lowered for marker in RATE_LIMIT_MARKERS)
+            output_state["transient"] |= any(marker in lowered for marker in TRANSIENT_MARKERS)
+            output_state["access_restricted"] |= any(marker in lowered for marker in ACCESS_RESTRICTED_MARKERS)
+            output_state["not_live"] |= any(marker in lowered for marker in NOT_LIVE_MARKERS)
+            output_state["normal_exit"] |= any(marker in lowered for marker in NORMAL_END_MARKERS)
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
 
 
 def classify_output(output_state):
@@ -1620,14 +1647,17 @@ def make_download_cmd(active, chunk_path, client, skip_webpage=True, use_proxy=F
     ] + JS_ARGS
 
     command += impersonate_args(client)
-    ffmpeg_in_args = "-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 10"
+    ffmpeg_in_args = "-loglevel warning -nostats -reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 10"
     if use_proxy:
         proxy = effective_proxy_url()
         if proxy:
             command += ["--proxy", proxy]
             if proxy.startswith("http://"):
                 ffmpeg_in_args = f"-http_proxy {proxy} " + ffmpeg_in_args
-    command += ["--downloader-args", f"ffmpeg_i:{ffmpeg_in_args}"]
+    command += [
+        "--downloader-args", f"ffmpeg_i:{ffmpeg_in_args}",
+        "--downloader-args", "ffmpeg:-loglevel warning -nostats",
+    ]
     command += build_extractor_args(client, skip_webpage=skip_webpage)
     if client not in COOKIE_INCOMPATIBLE_CLIENTS:
         if USE_COOKIES and COOKIE_FILE and os.path.isfile(COOKIE_FILE):
